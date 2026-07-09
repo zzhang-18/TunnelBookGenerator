@@ -1,6 +1,7 @@
 import {
   useState,
   useRef,
+  useEffect,
   type ChangeEvent,
 } from "react";
 import "./App.css";
@@ -8,9 +9,50 @@ import "./App.css";
 const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
 const apiUrl = (path: string) => `${API_BASE}${path}`;
 
+// Inferno-ish heatmap for the crease map: t in [0,1], dim/cool = smooth, bright/hot = strong edge.
+function heatColor(t: number): string {
+  const c = Math.max(0, Math.min(1, isFinite(t) ? t : 0));
+  const stops: [number, [number, number, number]][] = [
+    [0.0, [12, 14, 40]],
+    [0.35, [84, 24, 120]],
+    [0.6, [201, 44, 92]],
+    [0.8, [246, 130, 32]],
+    [1.0, [255, 240, 130]],
+  ];
+  let a = stops[0];
+  let b = stops[stops.length - 1];
+  for (let k = 0; k < stops.length - 1; k++) {
+    if (c >= stops[k][0] && c <= stops[k + 1][0]) {
+      a = stops[k];
+      b = stops[k + 1];
+      break;
+    }
+  }
+  const f = (c - a[0]) / (b[0] - a[0] || 1);
+  const mix = (u: number, v: number) => Math.round(u + (v - u) * f);
+  return `rgb(${mix(a[1][0], b[1][0])},${mix(a[1][1], b[1][1])},${mix(a[1][2], b[1][2])})`;
+}
+
 type ExportMode = "outline" | "engraving";
-type EdgePolyline = number[][];   // [[x, y], ...]
 type Screen = "home" | "edges" | "output";
+type MarkType = "split_soft" | "split_hard" | "delete";
+type EdgeItem = { index: number; i: number; j: number; segments: number[][]; score?: number };
+type SessionData = {
+  sessionId: string;
+  width: number;
+  height: number;
+  nLayers: number;
+  nRegions: number;
+  edges: EdgeItem[];
+  baselineOverlay: string | null;
+};
+type SolveResult = {
+  overlay: string;
+  nLayers: number;
+  status: string;
+  runtime: number;
+  objective: Record<string, number>;
+};
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
 
@@ -145,14 +187,10 @@ const I = {
 
 // ─── API functions ─────────────────────────────────────────────────────────────
 
-async function createSession(imageFile: File): Promise<{
-  sessionId: string;
-  width: number;
-  height: number;
-  edges: EdgePolyline[];
-}> {
+async function createSession(imageFile: File, nLayers: number): Promise<SessionData> {
   const fd = new FormData();
   fd.append("image", imageFile);
+  fd.append("n_layers", String(nLayers));
   const res = await fetch(apiUrl("/api/sessions"), { method: "POST", body: fd });
   if (!res.ok)
     throw new Error(
@@ -161,16 +199,40 @@ async function createSession(imageFile: File): Promise<{
   return res.json();
 }
 
-async function saveEdgeSelection(sessionId: string, selectedIndices: number[]): Promise<void> {
-  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/edge-selection`), {
+async function solveSession(
+  sessionId: string,
+  markings: { index: number; type: MarkType }[],
+  nLayers: number,
+  lambdaSplit: number,
+  objective: "depth" | "cut",
+  cutLogSigma: number,
+): Promise<SolveResult> {
+  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/solve`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ selected_indices: selectedIndices }),
+    body: JSON.stringify({
+      markings, n_layers: nLayers, lambda_split: lambdaSplit, objective,
+      cut_log_sigma: cutLogSigma,
+    }),
   });
   if (!res.ok)
     throw new Error(
-      (await res.text().catch(() => "")) || `Failed to save selection (${res.status})`,
+      (await res.text().catch(() => "")) || `Solve failed (${res.status})`,
     );
+  return res.json();
+}
+
+async function fetchScores(
+  sessionId: string,
+  cutLogSigma: number,
+): Promise<number[]> {
+  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/scores`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cut_log_sigma: cutLogSigma, cut_score: "laplacian" }),
+  });
+  if (!res.ok) throw new Error(`scores failed (${res.status})`);
+  return (await res.json()).scores as number[];
 }
 
 async function deleteSession(sessionId: string) {
@@ -561,46 +623,104 @@ function HomeScreen({
 // ─── Edge Selection Screen ────────────────────────────────────────────────────
 
 function EdgeSelectionScreen({
-  imageUrl,
+  sessionId,
   sessionWidth,
   sessionHeight,
   numLayers,
   edges,
+  baselineOverlay,
   onSubmit,
   onBack,
 }: {
-  imageUrl: string;
+  sessionId: string;
   sessionWidth: number;
   sessionHeight: number;
   numLayers: number;
-  edges: EdgePolyline[];
-  onSubmit: (selectedIndices: number[]) => Promise<void>;
+  edges: EdgeItem[];
+  baselineOverlay: string | null;
+  onSubmit: (markCount: number) => void;
   onBack: () => void;
 }) {
-  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [marks, setMarks] = useState<Record<number, MarkType>>({});
+  const [tool, setTool] = useState<MarkType>("split_soft");
+  const [objective, setObjective] = useState<"depth" | "cut">("depth");
+  const [logSigma, setLogSigma] = useState(2.0);
+  const [scoreOverride, setScoreOverride] = useState<number[] | null>(null);
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [overlay, setOverlay] = useState<string | null>(baselineOverlay);
+  const [isSolving, setIsSolving] = useState(false);
+  const [solveError, setSolveError] = useState<string | null>(null);
+  const [result, setResult] = useState<SolveResult | null>(null);
 
-  const toggle = (i: number) =>
-    setSelected((prev) => {
-      const s = new Set(prev);
-      s.has(i) ? s.delete(i) : s.add(i);
-      return s;
+  const TOOLS: { key: MarkType; label: string; color: string }[] = [
+    { key: "split_soft", label: "split · soft", color: "#f59e0b" },
+    { key: "split_hard", label: "split · hard", color: "#ef4444" },
+    { key: "delete", label: "delete", color: "#3b82f6" },
+  ];
+  const colorOf = (m: MarkType) => TOOLS.find((t) => t.key === m)!.color;
+
+  const applyMark = (i: number) =>
+    setMarks((prev) => {
+      const next = { ...prev };
+      if (next[i] === tool) delete next[i];
+      else next[i] = tool;
+      return next;
     });
 
-  const handleSubmit = async () => {
-    setIsSubmitting(true);
-    setSubmitError(null);
-    try {
-      await onSubmit([...selected]);
-    } catch (err: any) {
-      setSubmitError(err?.message ?? "Failed to save");
-      setIsSubmitting(false);
+  const counts: Record<MarkType, number> = { split_soft: 0, split_hard: 0, delete: 0 };
+  Object.values(marks).forEach((m) => (counts[m] += 1));
+  const markCount = Object.keys(marks).length;
+
+  const edgePath = (segs: number[][]) =>
+    segs.map(([x1, y1, x2, y2]) => `M${x1} ${y1}L${x2} ${y2}`).join("");
+
+  // crease strength per edge: live-recomputed override (slider) or the session baseline
+  const scoreOf = (e: EdgeItem) =>
+    scoreOverride ? scoreOverride[e.index] ?? 0 : e.score ?? 0;
+
+  // value the crease map colours by = "cuttability" (low cut cost). A soft mark sets the cut
+  // cost to 0, so it reads as maximally cuttable (brightest); depth creases fall out naturally.
+  const creaseCuttability = (e: EdgeItem) =>
+    marks[e.index] === "split_soft" ? 1 : scoreOf(e);
+
+  // debounced live recompute of the crease scores when the LoG scale slider moves
+  const didMountSigma = useRef(false);
+  useEffect(() => {
+    if (!didMountSigma.current) {
+      didMountSigma.current = true;
+      return; // initial render uses the baseline scores already in `edges`
     }
+    const t = setTimeout(() => {
+      fetchScores(sessionId, logSigma)
+        .then(setScoreOverride)
+        .catch(() => {});
+    }, 150);
+    return () => clearTimeout(t);
+  }, [logSigma, sessionId]);
+
+  const strokeFor = (i: number, m: MarkType | undefined) => {
+    const hov = hoveredIdx === i;
+    if (!m) return hov ? "rgba(255,255,255,0.85)" : "rgba(255,255,255,0.22)";
+    return colorOf(m);
   };
 
-  const polyPts = (pl: EdgePolyline) => pl.map(([x, y]) => `${x},${y}`).join(" ");
+  const handleSolve = async () => {
+    setIsSolving(true);
+    setSolveError(null);
+    try {
+      const markings = Object.entries(marks).map(([index, type]) => ({
+        index: Number(index),
+        type,
+      }));
+      const r = await solveSession(sessionId, markings, numLayers, 1.0, objective, logSigma);
+      setOverlay(r.overlay);
+      setResult(r);
+    } catch (err: any) {
+      setSolveError(err?.message ?? "Solve failed");
+    } finally {
+      setIsSolving(false);
+    }
+  };
 
   return (
     <div className="layer-screen">
@@ -610,84 +730,107 @@ function EdgeSelectionScreen({
         </button>
         <div className="layer-topbar-center">
           <div className="layer-badge" style={{ background: "#6366f1" }}>
-            edge_selection
+            mark_boundaries
           </div>
-          <span className="layer-of">for {numLayers} layer{numLayers !== 1 ? "s" : ""}</span>
+          <span className="layer-of">{numLayers} layers · {edges.length} boundaries</span>
         </div>
         <div className="layer-progress-wrap" style={{ alignItems: "center", gap: 10 }}>
-          <span style={{ fontSize: 11, color: "var(--text-dim)" }}>
-            {selected.size} / {edges.length} edges selected
-          </span>
+          <span style={{ fontSize: 11, color: "var(--text-dim)" }}>{markCount} marked</span>
         </div>
       </div>
 
       <div className="canvas-card">
         <div className="canvas-tools">
-          <span className="canvas-tools-hint">
-            <I.Brush /> click edges to mark as cut lines (red) or leave unselected (grey)
-          </span>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button
-              className="ctrl-btn ctrl-btn--ghost"
-              onClick={() => setSelected(new Set())}
-              disabled={selected.size === 0}
-            >
-              clear all
-            </button>
-            <button
-              className="ctrl-btn ctrl-btn--ghost"
-              onClick={() => setSelected(new Set(edges.map((_, i) => i)))}
-              disabled={selected.size === edges.length}
-            >
-              select all
-            </button>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>
+              <I.Brush /> tool:
+            </span>
+            {TOOLS.map((t) => (
+              <button
+                key={t.key}
+                className="ctrl-btn"
+                onClick={() => setTool(t.key)}
+                style={{
+                  borderColor: tool === t.key ? t.color : "transparent",
+                  color: tool === t.key ? t.color : "var(--text-dim)",
+                  fontWeight: tool === t.key ? 700 : 400,
+                }}
+              >
+                <span style={{
+                  display: "inline-block", width: 9, height: 9, borderRadius: 2,
+                  background: t.color, marginRight: 6, verticalAlign: "middle",
+                }} />
+                {t.label}
+              </button>
+            ))}
           </div>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>objective:</span>
+            {([
+              { key: "depth", label: "depth fit" },
+              { key: "cut", label: "cut · laplacian" },
+            ] as const).map((o) => (
+              <button
+                key={o.key}
+                className="ctrl-btn"
+                onClick={() => setObjective(o.key)}
+                title={o.key === "cut"
+                  ? "depth-aware boundary cut only (>=5 spx/layer); your edge marks drive the splits"
+                  : "fixed depth-bin fidelity (baseline)"}
+                style={{
+                  borderColor: objective === o.key ? "#22d3ee" : "transparent",
+                  color: objective === o.key ? "#22d3ee" : "var(--text-dim)",
+                  fontWeight: objective === o.key ? 700 : 400,
+                }}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+          <button
+            className="ctrl-btn ctrl-btn--ghost"
+            onClick={() => setMarks({})}
+            disabled={markCount === 0}
+          >
+            clear all
+          </button>
         </div>
 
-        {/* canvas-wrap is sized exactly to the image; SVG overlays it 1:1 */}
-        <div className="canvas-wrap" style={{ position: "relative" }}>
-          <img
-            src={imageUrl}
-            alt="Source"
-            draggable={false}
-            style={{ display: "block", width: "100%", height: "auto", pointerEvents: "none" }}
-          />
+        {/* canvas-wrap is sized to the image; SVG overlays it 1:1 */}
+        <div className="canvas-wrap" style={{ position: "relative", background: "#0b0b12" }}>
+          {overlay ? (
+            <img
+              src={overlay}
+              alt="Layer preview"
+              draggable={false}
+              style={{ display: "block", width: "100%", height: "auto", pointerEvents: "none" }}
+            />
+          ) : (
+            <div style={{ width: "100%", aspectRatio: `${sessionWidth} / ${sessionHeight}` }} />
+          )}
           <svg
             style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
             viewBox={`0 0 ${sessionWidth} ${sessionHeight}`}
             preserveAspectRatio="none"
           >
-            {edges.map((pl, i) => {
-              const isSel = selected.has(i);
-              const isHov = hoveredIdx === i;
-              const pts = polyPts(pl);
+            {edges.map((e) => {
+              const m = marks[e.index];
+              const d = edgePath(e.segments);
               return (
                 <g
-                  key={i}
-                  onClick={() => toggle(i)}
-                  onMouseEnter={() => setHoveredIdx(i)}
+                  key={e.index}
+                  onClick={() => applyMark(e.index)}
+                  onMouseEnter={() => setHoveredIdx(e.index)}
                   onMouseLeave={() => setHoveredIdx(null)}
                   style={{ cursor: "pointer" }}
                 >
-                  {/* Wide transparent stroke — hit target */}
-                  <polyline
-                    points={pts}
-                    stroke="transparent"
-                    strokeWidth={12}
-                    fill="none"
-                  />
-                  {/* Visible stroke */}
-                  <polyline
-                    points={pts}
-                    stroke={
-                      isSel
-                        ? isHov ? "#f87171" : "#ef4444"
-                        : isHov ? "rgba(255,255,255,0.75)" : "rgba(255,255,255,0.28)"
-                    }
-                    strokeWidth={isSel ? 2 : 1}
+                  <path d={d} stroke="transparent" strokeWidth={10} fill="none" />
+                  <path
+                    d={d}
+                    stroke={strokeFor(e.index, m)}
+                    strokeWidth={m ? 2.5 : 1}
                     fill="none"
                     strokeLinecap="round"
-                    strokeLinejoin="round"
                     pointerEvents="none"
                   />
                 </g>
@@ -697,26 +840,107 @@ function EdgeSelectionScreen({
         </div>
       </div>
 
-      <div className="layer-controls">
-        <div className="layer-controls-left">
-          <div className="points-pill" style={{ color: "#ef4444", borderColor: "#ef444444" }}>
-            {selected.size} cut
-          </div>
-          <div className="points-pill">
-            {edges.length - selected.size} ignored
+      {/* crease map: live heatmap of per-boundary depth-edge strength (the cut score) */}
+      <div className="canvas-card">
+        <div className="canvas-tools">
+          <span className="canvas-tools-hint" style={{ marginRight: 4 }}>
+            <I.Brush /> crease map — cut-cost field · soft marks read as free · click to mark
+          </span>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)" }}>
+            LoG σ {logSigma.toFixed(1)}px
+            <input
+              type="range" min={0.5} max={8} step={0.5} value={logSigma}
+              onChange={(ev) => setLogSigma(Number(ev.target.value))}
+              style={{ width: 110 }}
+            />
+          </label>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "var(--text-dim)" }}>
+            <span>costly to cut</span>
+            <span style={{
+              width: 120, height: 8, borderRadius: 4, display: "inline-block",
+              background: "linear-gradient(90deg, rgb(12,14,40), rgb(84,24,120), rgb(201,44,92), rgb(246,130,32), rgb(255,240,130))",
+            }} />
+            <span>free · crease</span>
           </div>
         </div>
-        <div className="layer-controls-right">
-          {submitError && <span className="seg-error-inline">// {submitError}</span>}
-          <button
-            className="next-btn"
-            onClick={handleSubmit}
-            disabled={isSubmitting}
+        <div className="canvas-wrap" style={{ position: "relative", background: "#07070c" }}>
+          <div style={{ width: "100%", aspectRatio: `${sessionWidth} / ${sessionHeight}` }} />
+          <svg
+            style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
+            viewBox={`0 0 ${sessionWidth} ${sessionHeight}`}
+            preserveAspectRatio="none"
           >
-            {isSubmitting ? (
-              <><span className="go-btn-spinner" /> saving…</>
+            {[...edges]
+              .sort((a, b) => creaseCuttability(a) - creaseCuttability(b))
+              .map((e) => {
+                const s = creaseCuttability(e);
+                const d = edgePath(e.segments);
+                const hov = hoveredIdx === e.index;
+                return (
+                  <g
+                    key={e.index}
+                    onClick={() => applyMark(e.index)}
+                    onMouseEnter={() => setHoveredIdx(e.index)}
+                    onMouseLeave={() => setHoveredIdx(null)}
+                    style={{ cursor: "pointer" }}
+                  >
+                    {/* wide invisible hit target so thin creases are still easy to click */}
+                    <path d={d} stroke="transparent" strokeWidth={10} fill="none" />
+                    {/* colour = cut-cost field (soft marks fold in as free); no mark highlight */}
+                    <path
+                      d={d}
+                      stroke={heatColor(s)}
+                      strokeWidth={0.5 + s * 3}
+                      opacity={0.2 + 0.8 * s}
+                      fill="none"
+                      strokeLinecap="round"
+                      pointerEvents="none"
+                    />
+                    {/* transient hover cue only (not a selection highlight) */}
+                    {hov && (
+                      <path
+                        d={d}
+                        stroke="rgba(255,255,255,0.5)"
+                        strokeWidth={1.2}
+                        fill="none"
+                        strokeLinecap="round"
+                        pointerEvents="none"
+                      />
+                    )}
+                  </g>
+                );
+              })}
+          </svg>
+        </div>
+      </div>
+
+      <div className="layer-controls">
+        <div className="layer-controls-left">
+          <div className="points-pill" style={{ color: "#f59e0b", borderColor: "#f59e0b44" }}>
+            {counts.split_soft} split·soft
+          </div>
+          <div className="points-pill" style={{ color: "#ef4444", borderColor: "#ef444444" }}>
+            {counts.split_hard} split·hard
+          </div>
+          <div className="points-pill" style={{ color: "#3b82f6", borderColor: "#3b82f644" }}>
+            {counts.delete} delete
+          </div>
+          {result && (
+            <div className="points-pill">
+              {result.status} · {result.runtime.toFixed(1)}s · obj {result.objective.total.toFixed(3)}
+            </div>
+          )}
+        </div>
+        <div className="layer-controls-right">
+          {solveError && <span className="seg-error-inline">// {solveError}</span>}
+          <button className="ctrl-btn ctrl-btn--ghost" onClick={() => onSubmit(markCount)}>
+            export →
+          </button>
+          <button className="next-btn" onClick={handleSolve} disabled={isSolving}>
+            {isSolving ? (
+              <><span className="go-btn-spinner" /> solving…</>
             ) : (
-              <><I.CheckCircle size={14} /> confirm cuts</>
+              <><I.Layers size={14} /> solve / preview</>
             )}
           </button>
         </div>
@@ -841,7 +1065,8 @@ function App() {
   const [frameWidthIn, setFrameWidthIn] = useState(12);
   const [frameHeightIn, setFrameHeightIn] = useState(9);
   const [frameBorderIn, setFrameBorderIn] = useState(0.5);
-  const [edges, setEdges] = useState<EdgePolyline[]>([]);
+  const [edges, setEdges] = useState<EdgeItem[]>([]);
+  const [baselineOverlay, setBaselineOverlay] = useState<string | null>(null);
   const [selectedEdgeCount, setSelectedEdgeCount] = useState(0);
 
   const reset = async () => {
@@ -851,6 +1076,7 @@ function App() {
     setSessionHeight(0);
     setTotalLayers(0);
     setEdges([]);
+    setBaselineOverlay(null);
     setSelectedEdgeCount(0);
     setBackendError(null);
     setFrameWidthIn(12);
@@ -872,14 +1098,15 @@ function App() {
     setBackendError(null);
     setIsStarting(true);
     try {
-      const { sessionId: sid, width, height, edges: detectedEdges } = await createSession(file);
+      const data = await createSession(file, count);
       setImageFile(file);
       setImageUrl(url);
       setTotalLayers(count);
-      setSessionId(sid);
-      setSessionWidth(width);
-      setSessionHeight(height);
-      setEdges(detectedEdges);
+      setSessionId(data.sessionId);
+      setSessionWidth(data.width);
+      setSessionHeight(data.height);
+      setEdges(data.edges);
+      setBaselineOverlay(data.baselineOverlay);
       setScreen("edges");
     } catch (err: any) {
       setBackendError(err?.message ?? "Failed to start backend");
@@ -888,10 +1115,8 @@ function App() {
     }
   };
 
-  const handleEdgeSubmit = async (selectedIndices: number[]) => {
-    if (!sessionId) return;
-    await saveEdgeSelection(sessionId, selectedIndices);
-    setSelectedEdgeCount(selectedIndices.length);
+  const handleEdgeSubmit = (markCount: number) => {
+    setSelectedEdgeCount(markCount);
     setScreen("output");
   };
 
@@ -915,13 +1140,14 @@ function App() {
               onExportModeChange={setExportMode}
             />
           )}
-          {screen === "edges" && imageUrl && sessionId && (
+          {screen === "edges" && sessionId && (
             <EdgeSelectionScreen
-              imageUrl={imageUrl}
+              sessionId={sessionId}
               sessionWidth={sessionWidth}
               sessionHeight={sessionHeight}
               numLayers={totalLayers}
               edges={edges}
+              baselineOverlay={baselineOverlay}
               onSubmit={handleEdgeSubmit}
               onBack={handleBack}
             />

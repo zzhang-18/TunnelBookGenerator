@@ -25,3 +25,7 @@ __pycache__/
 *.njsproj
 *.sln
 *.sw?
+
+# generated solver outputs (regenerable)
+src/checkpoint1/runs/
+src/checkpoint1/.spam_cache/
