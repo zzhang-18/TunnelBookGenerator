@@ -7,9 +7,10 @@ Flow:
                             MIP with those terms -> solve -> return a layer-assignment preview.
 
 Runs in tunnelbook's uv env (torch/cv2/skimage/gurobi + fastapi via the `serve` extra):
-  cd src/checkpoint1
-  uv run --project /Users/jz/work/tunnelbook python -m uvicorn server:app --port 8000
-Needs an active Gurobi license.
+  cd generator/src/checkpoint1
+  uv run --project ../../.. --extra serve --extra depth python -m uvicorn server:app --port 8000
+Needs an active Gurobi license.  Set SEG_BACKEND=slic for the CPU-only path (no CUDA/SPAM);
+see generator/README.md.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import json
 import os
 import re
 import uuid
+import zipfile
 from datetime import datetime
 from typing import List, Optional
 
@@ -35,8 +37,9 @@ from pydantic import BaseModel
 
 from tunnelbook.config import Config
 from tunnelbook.data.labelmap import build_instance, edge_depth_scores, region_boundary_segments
-from tunnelbook.data.realimage import compute_depth
+from tunnelbook.data.realimage import compute_depth, segment_image
 from tunnelbook.data.spam_segment import SAM_CHECKPOINT, segment_image_spam
+from tunnelbook.export import build_layer_ai_docs
 from tunnelbook.model import build_model
 from tunnelbook.solve import InfeasibleError, solve
 
@@ -47,6 +50,10 @@ MAX_DIM = 1024
 NSPIX = 200
 POINTS_PER_SIDE = 16
 USE_SAM = os.environ.get("SPAM_SAM", "1") != "0"          # SPAM_SAM=0 -> faster, no SAM
+# Segmentation backend: "spam" (learned superpixels, needs CUDA + SAM download) is the default;
+# "slic" is the CPU-only skimage path (tunnelbook.data.realimage.segment_image) -- no CUDA, no SAM,
+# so a teammate can run the whole UI on a laptop. Set SEG_BACKEND=slic to use it.
+SEG_BACKEND = os.environ.get("SEG_BACKEND", "spam").lower()
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spam_cache")
 RUNS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
 
@@ -63,7 +70,8 @@ class SolveRequest(BaseModel):
     lambda_split: float = 1.0
     time_limit: Optional[float] = 180.0
     objective: str = "depth"          # "depth" (fixed-bin fidelity) | "cut" (depth-aware cut only)
-    min_layer_regions: int = 5        # cut objective: force >= k superpixels per layer
+    min_layer_area: float = 0.10      # cut objective (DEFAULT floor): force each layer to own >= this fraction of image area
+    min_layer_regions: int = 0        # cut objective: optional count floor (>= k superpixels/layer); 0 = off (area floor is default)
     lambda_cut: float = 1.0           # cut objective: weight on the boundary-cut term
     cut_score: str = "laplacian"      # cut objective: "laplacian" | "meandiff"
     cut_log_sigma: float = 2.0        # cut objective: LoG spatial scale (px) for the crease score
@@ -78,6 +86,13 @@ class StandRequest(BaseModel):
     n_layers: int
     spoke_h_in: float = 1.4
     base_h_in: float = 0.65
+
+
+class ExportLayersRequest(SolveRequest):
+    """Solve payload (inherited) + per-layer .ai export params."""
+    mode: str = "engraving"           # "engraving" (cut + engrave outlines) | "outline" (cut only)
+    content_width_in: float = 12.0    # physical artwork width; height follows image aspect
+    border_in: float = 0.5            # red frame band around each sheet
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
@@ -106,6 +121,18 @@ def _cached_spam(rgb: np.ndarray) -> np.ndarray:
     os.makedirs(CACHE_DIR, exist_ok=True)
     np.save(fp, labels)
     return labels
+
+
+def _segment(rgb: np.ndarray) -> np.ndarray:
+    """Superpixel label map for the requested backend (``SEG_BACKEND``).
+
+    ``"slic"`` -> CPU-only skimage SLIC (no CUDA, no SAM download); ``"spam"`` (default) ->
+    the learned SPAM segmenter (cached on disk, needs CUDA).
+    """
+    if SEG_BACKEND == "slic":
+        print("[seg] SLIC (CPU) backend")
+        return segment_image(rgb)
+    return _cached_spam(rgb)
 
 
 def _png_bytes(rgb_uint8: np.ndarray) -> bytes:
@@ -178,7 +205,9 @@ def _edges_payload(inst, scores=None) -> List[dict]:
 def _build_cfg(req: "SolveRequest") -> Config:
     """Config for the requested objective.  ``"cut"`` drops the depth-fidelity term and lets the
     depth-aware boundary cut (plus the user's edge marks) drive the layering, with a per-layer
-    minimum so it can't collapse onto one sheet; ``"depth"`` is the original fixed-bin fidelity."""
+    *area* floor (default) so it can't collapse onto one sheet -- each layer must own at least
+    ``min_layer_area`` of the image; ``"depth"`` is the original fixed-bin fidelity.  The count
+    floor ``min_layer_regions`` remains available (0 = off) but the area floor is the default."""
     if req.objective == "cut":
         # soft splits are folded into the cut cost as zero-cost edges (build_model), so the
         # separate soft-split reward is off (lambda_split=0) to avoid double counting.
@@ -187,6 +216,7 @@ def _build_cfg(req: "SolveRequest") -> Config:
                       lambda_cut=req.lambda_cut, cut_cost="aware", cut_score=req.cut_score,
                       cut_log_sigma=req.cut_log_sigma,
                       use_contact_weight=True,  # kappa_e scales with shared-boundary length
+                      min_layer_area=req.min_layer_area,
                       min_layer_regions=req.min_layer_regions,
                       lambda_split=0.0, mip_gap=0.02,
                       time_limit=req.time_limit, verbose=False)
@@ -234,6 +264,7 @@ def _save_run(session_id: str, req: "SolveRequest", inst, sol,
         "session": session_id, "timestamp": ts,
         "n_layers": req.n_layers, "lambda_split": req.lambda_split,
         "objective_mode": req.objective, "min_layer_regions": req.min_layer_regions,
+        "min_layer_area": req.min_layer_area,
         "lambda_cut": req.lambda_cut, "cut_score": req.cut_score,
         "status": sol.status, "runtime": sol.runtime, "objective": sol.obj_breakdown,
         "markings": marks, "layer_of": [int(v) for v in sol.layer_of],
@@ -261,7 +292,7 @@ async def create_session(image: UploadFile = File(...), n_layers: int = Form(5))
     except Exception:
         raise HTTPException(status_code=400, detail="Could not read image")
 
-    label_map = _cached_spam(rgb)
+    label_map = _segment(rgb)
     depth = compute_depth(rgb, "model")  # Depth Anything V2 (the laplacian cut needs real depth)
     cfg = Config(n_layers=n_layers, fix_x=False, lambda_support=1.0, verbose=False)
     inst = build_instance(label_map, depth, cfg)
@@ -353,6 +384,35 @@ async def export_stand(session_id: str, req: StandRequest):
     base = re.sub(r"[^\x00-\x7F]+", "_", sess["filename"].rsplit(".", 1)[0])
     return Response(content=ai_content.encode("latin-1"), media_type="application/postscript",
                     headers={"Content-Disposition": f'attachment; filename="{base}_stand.ai"'})
+
+
+@app.post("/api/sessions/{session_id}/export-ai")
+async def export_ai(session_id: str, req: ExportLayersRequest):
+    """Re-solve with the current marks/config and return a zip of per-layer ``.ai`` sheets
+    (cut silhouette + engrave outlines), built by the shared ``export.build_layer_ai_docs``."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown session")
+    try:
+        _inst, sol = _solve_layers(sess, req)
+    except InfeasibleError as e:
+        raise HTTPException(status_code=409, detail=f"No feasible layering: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        docs = build_layer_ai_docs(sol, content_width_in=req.content_width_in,
+                                   engrave=(req.mode == "engraving"), border_in=req.border_in)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Layer export failed: {e}")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, doc in docs.items():
+            zf.writestr(name, doc.encode("latin-1"))
+    base = re.sub(r"[^\x00-\x7F]+", "_", sess["filename"].rsplit(".", 1)[0])
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{base}_layers.zip"'})
 
 
 if __name__ == "__main__":

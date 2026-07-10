@@ -2599,6 +2599,18 @@ body {
   transform: translateY(-1px);
 }
 
+.action-btn--layers {
+  background: linear-gradient(135deg, #e879f9, #a21caf);
+  color: #fff;
+  border: 1.5px solid rgba(232, 121, 249, 0.35);
+  box-shadow: 0 0 22px rgba(217, 70, 239, 0.35);
+}
+
+.action-btn--layers:hover:not(:disabled) {
+  box-shadow: 0 0 36px rgba(217, 70, 239, 0.55);
+  transform: translateY(-1px);
+}
+
 @media (max-width: 640px) {
   .sidebar {
     width: 50px;

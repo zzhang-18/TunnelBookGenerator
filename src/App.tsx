@@ -257,6 +257,30 @@ async function exportStand(
   return res.blob();
 }
 
+async function exportLayers(
+  sessionId: string,
+  markings: { index: number; type: MarkType }[],
+  nLayers: number,
+  objective: "depth" | "cut",
+  mode: ExportMode,
+  contentWidthIn: number,
+  borderIn: number,
+): Promise<Blob> {
+  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/export-ai`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      markings, n_layers: nLayers, objective,
+      mode, content_width_in: contentWidthIn, border_in: borderIn,
+    }),
+  });
+  if (!res.ok)
+    throw new Error(
+      (await res.text().catch(() => "")) || `Layer export failed (${res.status})`,
+    );
+  return res.blob();
+}
+
 // ─── Shared UI primitives ─────────────────────────────────────────────────────
 
 function Stars() {
@@ -396,7 +420,7 @@ function HomeScreen({
     !isNaN(parsedB) && parsedB >= 0 && parsedB <= 4;
   const canGo = !!imageUrl && parsed >= 1 && parsed <= 10 && !isStarting && frameValid;
 
-  const clampNum = (v: string, min: number, max: number) => {
+  const clampNum = (v: string, _min: number, max: number) => {
     const n = parseFloat(v);
     if (isNaN(n)) return v;
     if (n > max) return String(max);
@@ -638,7 +662,11 @@ function EdgeSelectionScreen({
   numLayers: number;
   edges: EdgeItem[];
   baselineOverlay: string | null;
-  onSubmit: (markCount: number) => void;
+  onSubmit: (
+    markings: { index: number; type: MarkType }[],
+    objective: "depth" | "cut",
+    markCount: number,
+  ) => void;
   onBack: () => void;
 }) {
   const [marks, setMarks] = useState<Record<number, MarkType>>({});
@@ -666,6 +694,9 @@ function EdgeSelectionScreen({
       else next[i] = tool;
       return next;
     });
+
+  const markingsArray = () =>
+    Object.entries(marks).map(([index, type]) => ({ index: Number(index), type }));
 
   const counts: Record<MarkType, number> = { split_soft: 0, split_hard: 0, delete: 0 };
   Object.values(marks).forEach((m) => (counts[m] += 1));
@@ -708,11 +739,7 @@ function EdgeSelectionScreen({
     setIsSolving(true);
     setSolveError(null);
     try {
-      const markings = Object.entries(marks).map(([index, type]) => ({
-        index: Number(index),
-        type,
-      }));
-      const r = await solveSession(sessionId, markings, numLayers, 1.0, objective, logSigma);
+      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma);
       setOverlay(r.overlay);
       setResult(r);
     } catch (err: any) {
@@ -933,7 +960,10 @@ function EdgeSelectionScreen({
         </div>
         <div className="layer-controls-right">
           {solveError && <span className="seg-error-inline">// {solveError}</span>}
-          <button className="ctrl-btn ctrl-btn--ghost" onClick={() => onSubmit(markCount)}>
+          <button
+            className="ctrl-btn ctrl-btn--ghost"
+            onClick={() => onSubmit(markingsArray(), objective, markCount)}
+          >
             export →
           </button>
           <button className="next-btn" onClick={handleSolve} disabled={isSolving}>
@@ -956,16 +986,28 @@ function OutputScreen({
   sessionId,
   numLayers,
   selectedEdgeCount,
+  markings,
+  objective,
+  exportMode,
+  frameWidthIn,
+  frameBorderIn,
   onBack,
 }: {
   imageFile: File | null;
   sessionId: string | null;
   numLayers: number;
   selectedEdgeCount: number;
+  markings: { index: number; type: MarkType }[];
+  objective: "depth" | "cut";
+  exportMode: ExportMode;
+  frameWidthIn: number;
+  frameBorderIn: number;
   onBack: () => void;
 }) {
   const [isExportingStand, setIsExportingStand] = useState(false);
   const [standError, setStandError] = useState<string | null>(null);
+  const [isExportingLayers, setIsExportingLayers] = useState(false);
+  const [layersError, setLayersError] = useState<string | null>(null);
 
   const baseName = imageFile ? imageFile.name.replace(/\.[^/.]+$/, "") : "output";
   const safeBase = baseName.replace(/\s+/g, "_");
@@ -993,6 +1035,25 @@ function OutputScreen({
       setStandError(err?.message ?? "Stand export failed");
     } finally {
       setIsExportingStand(false);
+    }
+  };
+
+  const handleDownloadLayers = async () => {
+    if (!sessionId) return;
+    setLayersError(null);
+    setIsExportingLayers(true);
+    try {
+      dlBlob(
+        `TunnelBook_${safeBase}_layers_${stamp}.zip`,
+        await exportLayers(
+          sessionId, markings, numLayers, objective,
+          exportMode, frameWidthIn, frameBorderIn,
+        ),
+      );
+    } catch (err: any) {
+      setLayersError(err?.message ?? "Layer export failed");
+    } finally {
+      setIsExportingLayers(false);
     }
   };
 
@@ -1030,6 +1091,14 @@ function OutputScreen({
 
       <div className="output-actions">
         <button
+          className="action-btn action-btn--layers"
+          onClick={handleDownloadLayers}
+          disabled={isExportingLayers || !sessionId}
+          title={`Solve and export all ${numLayers} layer sheets as .ai (${exportMode})`}
+        >
+          <I.Layers /> {isExportingLayers ? "solving…" : "export_layers.zip"}
+        </button>
+        <button
           className="action-btn action-btn--stand"
           onClick={handleDownloadStand}
           disabled={isExportingStand || !sessionId}
@@ -1039,6 +1108,11 @@ function OutputScreen({
         </button>
       </div>
 
+      {layersError && (
+        <div className="error-banner">
+          <span className="error-banner-tag">// error</span> {layersError}
+        </div>
+      )}
       {standError && (
         <div className="error-banner">
           <span className="error-banner-tag">// error</span> {standError}
@@ -1053,7 +1127,7 @@ function OutputScreen({
 function App() {
   const [screen, setScreen] = useState<Screen>("home");
   const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [, setImageUrl] = useState<string | null>(null);  // url set on upload; only imageFile is read here
   const [totalLayers, setTotalLayers] = useState(0);
   const [showHelp, setShowHelp] = useState(false);
   const [exportMode, setExportMode] = useState<ExportMode>("outline");
@@ -1063,11 +1137,13 @@ function App() {
   const [isStarting, setIsStarting] = useState(false);
   const [backendError, setBackendError] = useState<string | null>(null);
   const [frameWidthIn, setFrameWidthIn] = useState(12);
-  const [frameHeightIn, setFrameHeightIn] = useState(9);
+  const [, setFrameHeightIn] = useState(9);  // height follows image aspect in export; only width/border are read
   const [frameBorderIn, setFrameBorderIn] = useState(0.5);
   const [edges, setEdges] = useState<EdgeItem[]>([]);
   const [baselineOverlay, setBaselineOverlay] = useState<string | null>(null);
   const [selectedEdgeCount, setSelectedEdgeCount] = useState(0);
+  const [markings, setMarkings] = useState<{ index: number; type: MarkType }[]>([]);
+  const [objective, setObjective] = useState<"depth" | "cut">("depth");
 
   const reset = async () => {
     if (sessionId) await deleteSession(sessionId);
@@ -1078,6 +1154,8 @@ function App() {
     setEdges([]);
     setBaselineOverlay(null);
     setSelectedEdgeCount(0);
+    setMarkings([]);
+    setObjective("depth");
     setBackendError(null);
     setFrameWidthIn(12);
     setFrameHeightIn(9);
@@ -1115,7 +1193,13 @@ function App() {
     }
   };
 
-  const handleEdgeSubmit = (markCount: number) => {
+  const handleEdgeSubmit = (
+    marks: { index: number; type: MarkType }[],
+    obj: "depth" | "cut",
+    markCount: number,
+  ) => {
+    setMarkings(marks);
+    setObjective(obj);
     setSelectedEdgeCount(markCount);
     setScreen("output");
   };
@@ -1158,6 +1242,11 @@ function App() {
               sessionId={sessionId}
               numLayers={totalLayers}
               selectedEdgeCount={selectedEdgeCount}
+              markings={markings}
+              objective={objective}
+              exportMode={exportMode}
+              frameWidthIn={frameWidthIn}
+              frameBorderIn={frameBorderIn}
               onBack={handleBack}
             />
           )}
