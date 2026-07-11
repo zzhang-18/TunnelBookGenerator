@@ -37,6 +37,12 @@ type ExportMode = "outline" | "engraving";
 type Screen = "home" | "edges" | "output";
 type MarkType = "split_soft" | "split_hard" | "delete";
 type EdgeItem = { index: number; i: number; j: number; segments: number[][]; score?: number };
+type EdgeConfigItem = {
+  name: string;
+  created: string | null;
+  n_marks: number;
+  counts: Record<MarkType, number>;
+};
 type SessionData = {
   sessionId: string;
   width: number;
@@ -45,6 +51,8 @@ type SessionData = {
   nRegions: number;
   edges: EdgeItem[];
   baselineOverlay: string | null;
+  datasetSlug?: string;
+  edgeConfigs?: EdgeConfigItem[];
 };
 type SolveResult = {
   overlay: string;
@@ -233,6 +241,38 @@ async function fetchScores(
   });
   if (!res.ok) throw new Error(`scores failed (${res.status})`);
   return (await res.json()).scores as number[];
+}
+
+async function saveEdgeConfig(
+  sessionId: string,
+  name: string,
+  markings: { index: number; type: MarkType }[],
+  nLayers: number | null = null,
+): Promise<{ configs: EdgeConfigItem[] }> {
+  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/edge-configs`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, markings, n_layers: nLayers }),
+  });
+  if (!res.ok)
+    throw new Error(
+      (await res.text().catch(() => "")) || `Config save failed (${res.status})`,
+    );
+  return res.json();
+}
+
+async function loadEdgeConfig(
+  sessionId: string,
+  name: string,
+): Promise<{ markings: { index: number; type: MarkType }[] }> {
+  const res = await fetch(
+    apiUrl(`/api/sessions/${sessionId}/edge-configs/${encodeURIComponent(name)}`),
+  );
+  if (!res.ok)
+    throw new Error(
+      (await res.text().catch(() => "")) || `Config load failed (${res.status})`,
+    );
+  return res.json();
 }
 
 async function deleteSession(sessionId: string) {
@@ -653,6 +693,7 @@ function EdgeSelectionScreen({
   numLayers,
   edges,
   baselineOverlay,
+  edgeConfigs,
   onSubmit,
   onBack,
 }: {
@@ -662,6 +703,7 @@ function EdgeSelectionScreen({
   numLayers: number;
   edges: EdgeItem[];
   baselineOverlay: string | null;
+  edgeConfigs: EdgeConfigItem[];
   onSubmit: (
     markings: { index: number; type: MarkType }[],
     objective: "depth" | "cut",
@@ -679,6 +721,12 @@ function EdgeSelectionScreen({
   const [isSolving, setIsSolving] = useState(false);
   const [solveError, setSolveError] = useState<string | null>(null);
   const [result, setResult] = useState<SolveResult | null>(null);
+  // named edge configs stored in the session's dataset dir
+  const [configs, setConfigs] = useState<EdgeConfigItem[]>(edgeConfigs);
+  const [configName, setConfigName] = useState("");
+  const [selectedConfig, setSelectedConfig] = useState("");
+  const [configBusy, setConfigBusy] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
 
   const TOOLS: { key: MarkType; label: string; color: string }[] = [
     { key: "split_soft", label: "split · soft", color: "#f59e0b" },
@@ -746,6 +794,33 @@ function EdgeSelectionScreen({
       setSolveError(err?.message ?? "Solve failed");
     } finally {
       setIsSolving(false);
+    }
+  };
+
+  const handleConfigSave = async () => {
+    setConfigBusy(true);
+    setConfigError(null);
+    try {
+      const r = await saveEdgeConfig(sessionId, configName, markingsArray(), numLayers);
+      setConfigs(r.configs);
+      setSelectedConfig(configName);
+    } catch (err: any) {
+      setConfigError(err?.message ?? "Config save failed");
+    } finally {
+      setConfigBusy(false);
+    }
+  };
+
+  const handleConfigLoad = async () => {
+    setConfigBusy(true);
+    setConfigError(null);
+    try {
+      const r = await loadEdgeConfig(sessionId, selectedConfig);
+      setMarks(Object.fromEntries(r.markings.map((m) => [m.index, m.type])));
+    } catch (err: any) {
+      setConfigError(err?.message ?? "Config load failed");
+    } finally {
+      setConfigBusy(false);
     }
   };
 
@@ -821,6 +896,57 @@ function EdgeSelectionScreen({
           >
             clear all
           </button>
+        </div>
+
+        {/* named edge configs: save/load the current marks into the session's dataset dir */}
+        <div className="canvas-tools">
+          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>configs:</span>
+            <input
+              type="text"
+              placeholder="config name"
+              value={configName}
+              onChange={(e) => setConfigName(e.target.value.replace(/[^A-Za-z0-9._-]/g, ""))}
+              style={{
+                width: 130, padding: "4px 8px", borderRadius: 6,
+                border: "1px solid var(--border-dim)", background: "rgba(0,0,0,0.3)",
+                color: "var(--text-mid)", fontFamily: "var(--font-mono)", fontSize: 11,
+              }}
+            />
+            <button
+              className="ctrl-btn ctrl-btn--ghost"
+              onClick={handleConfigSave}
+              disabled={!configName || markCount === 0 || configBusy}
+              title="Save the current marks as a named config in this image's dataset"
+            >
+              save
+            </button>
+            <select
+              value={selectedConfig}
+              onChange={(e) => setSelectedConfig(e.target.value)}
+              style={{
+                maxWidth: 180, padding: "4px 6px", borderRadius: 6,
+                border: "1px solid var(--border-dim)", background: "rgba(0,0,0,0.3)",
+                color: "var(--text-mid)", fontFamily: "var(--font-mono)", fontSize: 11,
+              }}
+            >
+              <option value="">— saved configs —</option>
+              {configs.map((c) => (
+                <option key={c.name} value={c.name}>
+                  {c.name} ({c.n_marks})
+                </option>
+              ))}
+            </select>
+            <button
+              className="ctrl-btn ctrl-btn--ghost"
+              onClick={handleConfigLoad}
+              disabled={!selectedConfig || configBusy}
+              title="Replace the current marks with this saved config"
+            >
+              load
+            </button>
+            {configError && <span className="seg-error-inline">// {configError}</span>}
+          </div>
         </div>
 
         {/* canvas-wrap is sized to the image; SVG overlays it 1:1 */}
@@ -1141,6 +1267,7 @@ function App() {
   const [frameBorderIn, setFrameBorderIn] = useState(0.5);
   const [edges, setEdges] = useState<EdgeItem[]>([]);
   const [baselineOverlay, setBaselineOverlay] = useState<string | null>(null);
+  const [edgeConfigs, setEdgeConfigs] = useState<EdgeConfigItem[]>([]);
   const [selectedEdgeCount, setSelectedEdgeCount] = useState(0);
   const [markings, setMarkings] = useState<{ index: number; type: MarkType }[]>([]);
   const [objective, setObjective] = useState<"depth" | "cut">("depth");
@@ -1153,6 +1280,7 @@ function App() {
     setTotalLayers(0);
     setEdges([]);
     setBaselineOverlay(null);
+    setEdgeConfigs([]);
     setSelectedEdgeCount(0);
     setMarkings([]);
     setObjective("depth");
@@ -1185,6 +1313,7 @@ function App() {
       setSessionHeight(data.height);
       setEdges(data.edges);
       setBaselineOverlay(data.baselineOverlay);
+      setEdgeConfigs(data.edgeConfigs ?? []);
       setScreen("edges");
     } catch (err: any) {
       setBackendError(err?.message ?? "Failed to start backend");
@@ -1232,6 +1361,7 @@ function App() {
               numLayers={totalLayers}
               edges={edges}
               baselineOverlay={baselineOverlay}
+              edgeConfigs={edgeConfigs}
               onSubmit={handleEdgeSubmit}
               onBack={handleBack}
             />

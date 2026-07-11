@@ -1,10 +1,14 @@
 """TunnelBook backend: SPAM superpixels -> mark region boundaries (split/delete) -> solve.
 
 Flow:
-  POST /api/sessions        upload image -> resize -> (cached) SPAM superpixels -> depth ->
-                            ProblemInstance -> per-boundary segments + baseline layer solve.
+  POST /api/sessions        upload image -> resize -> datasets/ cache lookup by content hash
+                            (frozen segmentation + depth from tunnelbook.data.dataset; on miss
+                            compute (cached) SPAM superpixels + depth, then save a new dataset)
+                            -> ProblemInstance -> per-boundary segments + baseline layer solve.
   POST /api/sessions/{id}/solve   mark boundaries split_soft/split_hard/delete -> build the
                             MIP with those terms -> solve -> return a layer-assignment preview.
+  /api/sessions/{id}/edge-configs   save/load named edge-mark sets in the session's dataset dir
+                            (marks stored as original region-label pairs).
 
 Runs in tunnelbook's uv env (torch/cv2/skimage/gurobi + fastapi via the `serve` extra):
   cd generator/src/checkpoint1
@@ -36,6 +40,10 @@ from PIL import Image
 from pydantic import BaseModel
 
 from tunnelbook.config import Config
+from tunnelbook.data.dataset import (
+    find_dataset, indices_to_pairs, label_map_md5, list_edge_configs,
+    load_dataset, load_edge_config, resolve_marks, save_dataset, save_edge_config,
+)
 from tunnelbook.data.labelmap import build_instance, edge_depth_scores, region_boundary_segments
 from tunnelbook.data.realimage import compute_depth, segment_image
 from tunnelbook.data.spam_segment import SAM_CHECKPOINT, segment_image_spam
@@ -80,6 +88,12 @@ class SolveRequest(BaseModel):
 class ScoresRequest(BaseModel):
     cut_score: str = "laplacian"
     cut_log_sigma: float = 2.0
+
+
+class EdgeConfigSaveRequest(BaseModel):
+    name: str
+    markings: List[Marking] = []
+    n_layers: Optional[int] = None
 
 
 class StandRequest(BaseModel):
@@ -292,8 +306,31 @@ async def create_session(image: UploadFile = File(...), n_layers: int = Form(5))
     except Exception:
         raise HTTPException(status_code=400, detail="Could not read image")
 
-    label_map = _segment(rgb)
-    depth = compute_depth(rgb, "model")  # Depth Anything V2 (the laplacian cut needs real depth)
+    # datasets/ cache: frozen segmentation + depth keyed by RGB content hash (no GPU on a hit)
+    d = find_dataset(rgb)
+    heal = False  # a corrupt dataset dir must be force-rewritten, not skipped as "exists"
+    if d is not None:
+        try:
+            b = load_dataset(d)
+            label_map, depth = b.label_map, b.depth
+            print(f"[dataset] hit {b.slug} (skipping segmentation+depth)")
+        except Exception as e:  # corrupt/torn dataset dir: recompute + rewrite, don't 500 forever
+            print(f"[dataset] {d.name} unreadable ({type(e).__name__}: {e}); recomputing")
+            d, heal = None, True
+    if d is None:
+        label_map = _segment(rgb)
+        depth = compute_depth(rgb, "model")  # Depth Anything V2 (the laplacian cut needs real depth)
+        seg_params = (
+            {"backend": "slic", "max_dim": MAX_DIM} if SEG_BACKEND == "slic"
+            else {"backend": SEG_BACKEND, "nspix": NSPIX, "points_per_side": POINTS_PER_SIDE,
+                  "sam": USE_SAM, "max_dim": MAX_DIM}
+        )
+        d = save_dataset(rgb, label_map, depth,
+                         source_name=image.filename or "image",
+                         seg_params=seg_params,
+                         depth_params={"source": "model", "model_name": "large", "infer_size": None},
+                         force=heal)  # heal: overwrite the corrupt copy (edge configs survive)
+        print(f"[dataset] saved {d.name}")
     cfg = Config(n_layers=n_layers, fix_x=False, lambda_support=1.0, verbose=False)
     inst = build_instance(label_map, depth, cfg)
 
@@ -303,6 +340,7 @@ async def create_session(image: UploadFile = File(...), n_layers: int = Form(5))
         "rgb": rgb, "label_map": label_map, "depth": depth, "inst": inst,
         "width": w, "height": h, "filename": image.filename or "image",
         "n_regions": inst.n_regions,
+        "dataset_dir": str(d), "dataset_slug": d.name,
     }
     _sessions[session_id] = sess
 
@@ -319,6 +357,7 @@ async def create_session(image: UploadFile = File(...), n_layers: int = Form(5))
         "sessionId": session_id, "width": w, "height": h,
         "nLayers": n_layers, "nRegions": inst.n_regions,
         "edges": edges, "baselineOverlay": baseline, "baselineLayers": baseline_layers,
+        "datasetSlug": d.name, "edgeConfigs": list_edge_configs(d),
     }
 
 
@@ -358,6 +397,48 @@ async def recompute_scores(session_id: str, req: ScoresRequest):
     scores = edge_depth_scores(sess["inst"], depth_map=sess["depth"],
                                method=req.cut_score, log_sigma=req.cut_log_sigma)
     return {"scores": [float(s) for s in scores]}
+
+
+@app.get("/api/sessions/{session_id}/edge-configs")
+async def get_edge_configs(session_id: str):
+    """Named edge configs stored in this session's dataset dir."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown session")
+    return {"configs": list_edge_configs(sess["dataset_dir"])}
+
+
+@app.post("/api/sessions/{session_id}/edge-configs")
+async def save_session_edge_config(session_id: str, req: EdgeConfigSaveRequest):
+    """Persist the current UI marks as ``edges/<name>.json`` (original region-label pairs)."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown session")
+    pairs = indices_to_pairs(sess["inst"], [{"index": m.index, "type": m.type}
+                                            for m in req.markings])
+    try:
+        save_edge_config(sess["dataset_dir"], req.name, pairs,
+                         lm_md5=label_map_md5(sess["inst"].label_map), n_layers=req.n_layers)
+    except ValueError as e:  # bad name or unknown mark type
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "name": req.name, "nMarks": len(pairs),
+            "configs": list_edge_configs(sess["dataset_dir"])}
+
+
+@app.get("/api/sessions/{session_id}/edge-configs/{name}")
+async def load_session_edge_config(session_id: str, name: str):
+    """Resolve a stored config back to UI edge indices for this session's instance."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown session")
+    try:
+        cfg = load_edge_config(sess["dataset_dir"], name)
+        resolved = resolve_marks(sess["inst"], cfg)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"No edge config named {name!r}")
+    except ValueError as e:  # bad name or label_map_md5 mismatch (segmentation changed)
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"name": name, "markings": resolved["markings"], "nLayers": cfg.get("n_layers")}
 
 
 @app.delete("/api/sessions/{session_id}")
