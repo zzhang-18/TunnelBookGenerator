@@ -483,7 +483,8 @@ async def export_ai(session_id: str, req: ExportLayersRequest):
 
     try:
         docs = build_layer_ai_docs(sol, content_width_in=req.content_width_in,
-                                   engrave=(req.mode == "engraving"), border_in=req.border_in)
+                                   engrave=(req.mode == "engraving"), border_in=req.border_in,
+                                   rgb=sess["rgb"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Layer export failed: {e}")
 
