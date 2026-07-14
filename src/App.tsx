@@ -3,6 +3,7 @@ import {
   useRef,
   useEffect,
   type ChangeEvent,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 import "./App.css";
 
@@ -51,6 +52,8 @@ type SessionData = {
   nRegions: number;
   edges: EdgeItem[];
   baselineOverlay: string | null;
+  regionMap?: string | null;
+  regionDepth?: number[];
   datasetSlug?: string;
   edgeConfigs?: EdgeConfigItem[];
 };
@@ -60,6 +63,8 @@ type SolveResult = {
   status: string;
   runtime: number;
   objective: Record<string, number>;
+  z?: number[] | null;
+  layerOf?: number[];
 };
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
@@ -214,13 +219,17 @@ async function solveSession(
   lambdaSplit: number,
   objective: "depth" | "cut",
   cutLogSigma: number,
+  lambdaDepth: number,
+  connectivity: boolean,
+  yMonotone: boolean,
 ): Promise<SolveResult> {
   const res = await fetch(apiUrl(`/api/sessions/${sessionId}/solve`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       markings, n_layers: nLayers, lambda_split: lambdaSplit, objective,
-      cut_log_sigma: cutLogSigma,
+      cut_log_sigma: cutLogSigma, lambda_depth: lambdaDepth,
+      connectivity, y_monotone: yMonotone,
     }),
   });
   if (!res.ok)
@@ -302,6 +311,9 @@ async function exportLayers(
   markings: { index: number; type: MarkType }[],
   nLayers: number,
   objective: "depth" | "cut",
+  lambdaDepth: number,
+  connectivity: boolean,
+  yMonotone: boolean,
   mode: ExportMode,
   contentWidthIn: number,
   borderIn: number,
@@ -310,7 +322,8 @@ async function exportLayers(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      markings, n_layers: nLayers, objective,
+      markings, n_layers: nLayers, objective, lambda_depth: lambdaDepth,
+      connectivity, y_monotone: yMonotone,
       mode, content_width_in: contentWidthIn, border_in: borderIn,
     }),
   });
@@ -693,6 +706,8 @@ function EdgeSelectionScreen({
   numLayers,
   edges,
   baselineOverlay,
+  regionMap,
+  regionDepth,
   edgeConfigs,
   onSubmit,
   onBack,
@@ -703,18 +718,29 @@ function EdgeSelectionScreen({
   numLayers: number;
   edges: EdgeItem[];
   baselineOverlay: string | null;
+  regionMap: string | null;
+  regionDepth: number[];
   edgeConfigs: EdgeConfigItem[];
   onSubmit: (
     markings: { index: number; type: MarkType }[],
     objective: "depth" | "cut",
     markCount: number,
+    lambdaDepth: number,
+    connectivity: boolean,
+    yMonotone: boolean,
   ) => void;
   onBack: () => void;
 }) {
   const [marks, setMarks] = useState<Record<number, MarkType>>({});
   const [tool, setTool] = useState<MarkType>("split_soft");
   const [objective, setObjective] = useState<"depth" | "cut">("depth");
+  const [lambdaDepth, setLambdaDepth] = useState(0);
+  const [connectivity, setConnectivity] = useState(true);
+  const [yMonotone, setYMonotone] = useState(false);
   const [logSigma, setLogSigma] = useState(2.0);
+  // per-pixel positional region index decoded from regionMap (idx+1 in R + G<<8; 0 = none)
+  const regionIdxRef = useRef<{ data: Uint8ClampedArray; w: number; h: number } | null>(null);
+  const [hoverRegion, setHoverRegion] = useState<{ idx: number; px: number; py: number } | null>(null);
   const [scoreOverride, setScoreOverride] = useState<number[] | null>(null);
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   const [overlay, setOverlay] = useState<string | null>(baselineOverlay);
@@ -777,6 +803,41 @@ function EdgeSelectionScreen({
     return () => clearTimeout(t);
   }, [logSigma, sessionId]);
 
+  // decode the region-index map once per session for hover hit-testing
+  useEffect(() => {
+    regionIdxRef.current = null;
+    if (!regionMap) return;
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement("canvas");
+      c.width = img.width;
+      c.height = img.height;
+      const ctx = c.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0);
+      const { data } = ctx.getImageData(0, 0, img.width, img.height);
+      regionIdxRef.current = { data, w: img.width, h: img.height };
+    };
+    img.src = regionMap;
+  }, [regionMap]);
+
+  const handleRegionHover = (ev: ReactMouseEvent<HTMLDivElement>) => {
+    const m = regionIdxRef.current;
+    if (!m) return;
+    const rect = ev.currentTarget.getBoundingClientRect();
+    const relX = (ev.clientX - rect.left) / rect.width;
+    const relY = (ev.clientY - rect.top) / rect.height;
+    const ix = Math.min(m.w - 1, Math.max(0, Math.floor(relX * m.w)));
+    const iy = Math.min(m.h - 1, Math.max(0, Math.floor(relY * m.h)));
+    const o = (iy * m.w + ix) * 4;
+    const idx = m.data[o] + (m.data[o + 1] << 8) - 1;
+    if (idx < 0) {
+      setHoverRegion(null);
+      return;
+    }
+    setHoverRegion({ idx, px: ev.clientX - rect.left, py: ev.clientY - rect.top });
+  };
+
   const strokeFor = (i: number, m: MarkType | undefined) => {
     const hov = hoveredIdx === i;
     if (!m) return hov ? "rgba(255,255,255,0.85)" : "rgba(255,255,255,0.22)";
@@ -787,7 +848,7 @@ function EdgeSelectionScreen({
     setIsSolving(true);
     setSolveError(null);
     try {
-      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma);
+      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma, lambdaDepth, connectivity, yMonotone);
       setOverlay(r.overlay);
       setResult(r);
     } catch (err: any) {
@@ -888,6 +949,39 @@ function EdgeSelectionScreen({
                 {o.label}
               </button>
             ))}
+            {objective === "cut" && (
+              <label
+                title="k-median depth anchor: 0 = pure cut (your marks drive everything); above ~0.5 depth dominates and marks stop mattering"
+                style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)", marginLeft: 8 }}
+              >
+                depth λ {lambdaDepth.toFixed(2)}
+                <input
+                  type="range" min={0} max={1} step={0.05} value={lambdaDepth}
+                  onChange={(ev) => setLambdaDepth(Number(ev.target.value))}
+                  style={{ width: 110 }}
+                />
+              </label>
+            )}
+            <label
+              title="Flow connectivity: every retained piece must reach the frame. Off = explore unfabricable layerings (pieces may float)"
+              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)", marginLeft: 8 }}
+            >
+              <input
+                type="checkbox" checked={connectivity}
+                onChange={(ev) => setConnectivity(ev.target.checked)}
+              />
+              fabrication
+            </label>
+            <label
+              title="Full backing: once a region shows on layer l, every sheet behind l keeps its material (y = cumsum x). Same front view, simpler MIP, heavier build"
+              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)" }}
+            >
+              <input
+                type="checkbox" checked={yMonotone}
+                onChange={(ev) => setYMonotone(ev.target.checked)}
+              />
+              full backing
+            </label>
           </div>
           <button
             className="ctrl-btn ctrl-btn--ghost"
@@ -950,7 +1044,12 @@ function EdgeSelectionScreen({
         </div>
 
         {/* canvas-wrap is sized to the image; SVG overlays it 1:1 */}
-        <div className="canvas-wrap" style={{ position: "relative", background: "#0b0b12" }}>
+        <div
+          className="canvas-wrap"
+          style={{ position: "relative", background: "#0b0b12" }}
+          onMouseMove={handleRegionHover}
+          onMouseLeave={() => setHoverRegion(null)}
+        >
           {overlay ? (
             <img
               src={overlay}
@@ -960,6 +1059,31 @@ function EdgeSelectionScreen({
             />
           ) : (
             <div style={{ width: "100%", aspectRatio: `${sessionWidth} / ${sessionHeight}` }} />
+          )}
+          {hoverRegion && regionDepth[hoverRegion.idx] !== undefined && (
+            <div style={{
+              position: "absolute", left: hoverRegion.px + 14, top: hoverRegion.py + 14,
+              pointerEvents: "none", zIndex: 5, background: "rgba(10,10,18,0.92)",
+              border: "1px solid rgba(255,255,255,0.18)", borderRadius: 6,
+              padding: "6px 8px", fontSize: 11, fontFamily: "monospace",
+              color: "var(--text-dim)", whiteSpace: "pre", lineHeight: 1.5,
+            }}>
+              {(() => {
+                const d = regionDepth[hoverRegion.idx];
+                const lines = [`region ${hoverRegion.idx} · depth ${d.toFixed(3)}`];
+                if (result?.layerOf?.[hoverRegion.idx] !== undefined)
+                  lines.push(`assigned layer ${result.layerOf[hoverRegion.idx]}`);
+                if (result?.z?.length) {
+                  const dist = result.z.map((zi) => Math.abs(d - zi));
+                  const best = dist.indexOf(Math.min(...dist));
+                  result.z.forEach((zi, i) => {
+                    const star = i === best ? " ◂" : "";
+                    lines.push(`z${i + 1}=${zi.toFixed(2)}  |d−z|=${dist[i].toFixed(3)}${star}`);
+                  });
+                }
+                return lines.join("\n");
+              })()}
+            </div>
           )}
           <svg
             style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
@@ -1088,7 +1212,7 @@ function EdgeSelectionScreen({
           {solveError && <span className="seg-error-inline">// {solveError}</span>}
           <button
             className="ctrl-btn ctrl-btn--ghost"
-            onClick={() => onSubmit(markingsArray(), objective, markCount)}
+            onClick={() => onSubmit(markingsArray(), objective, markCount, lambdaDepth, connectivity, yMonotone)}
           >
             export →
           </button>
@@ -1114,6 +1238,9 @@ function OutputScreen({
   selectedEdgeCount,
   markings,
   objective,
+  lambdaDepth,
+  connectivity,
+  yMonotone,
   exportMode,
   frameWidthIn,
   frameBorderIn,
@@ -1125,6 +1252,9 @@ function OutputScreen({
   selectedEdgeCount: number;
   markings: { index: number; type: MarkType }[];
   objective: "depth" | "cut";
+  lambdaDepth: number;
+  connectivity: boolean;
+  yMonotone: boolean;
   exportMode: ExportMode;
   frameWidthIn: number;
   frameBorderIn: number;
@@ -1172,7 +1302,8 @@ function OutputScreen({
       dlBlob(
         `TunnelBook_${safeBase}_layers_${stamp}.zip`,
         await exportLayers(
-          sessionId, markings, numLayers, objective,
+          sessionId, markings, numLayers, objective, lambdaDepth,
+          connectivity, yMonotone,
           exportMode, frameWidthIn, frameBorderIn,
         ),
       );
@@ -1271,6 +1402,11 @@ function App() {
   const [selectedEdgeCount, setSelectedEdgeCount] = useState(0);
   const [markings, setMarkings] = useState<{ index: number; type: MarkType }[]>([]);
   const [objective, setObjective] = useState<"depth" | "cut">("depth");
+  const [lambdaDepth, setLambdaDepth] = useState(0);
+  const [connectivity, setConnectivity] = useState(true);
+  const [yMonotone, setYMonotone] = useState(false);
+  const [regionMap, setRegionMap] = useState<string | null>(null);
+  const [regionDepth, setRegionDepth] = useState<number[]>([]);
 
   const reset = async () => {
     if (sessionId) await deleteSession(sessionId);
@@ -1313,6 +1449,8 @@ function App() {
       setSessionHeight(data.height);
       setEdges(data.edges);
       setBaselineOverlay(data.baselineOverlay);
+      setRegionMap(data.regionMap ?? null);
+      setRegionDepth(data.regionDepth ?? []);
       setEdgeConfigs(data.edgeConfigs ?? []);
       setScreen("edges");
     } catch (err: any) {
@@ -1326,9 +1464,15 @@ function App() {
     marks: { index: number; type: MarkType }[],
     obj: "depth" | "cut",
     markCount: number,
+    lambdaD: number,
+    conn: boolean,
+    yMono: boolean,
   ) => {
     setMarkings(marks);
     setObjective(obj);
+    setLambdaDepth(lambdaD);
+    setConnectivity(conn);
+    setYMonotone(yMono);
     setSelectedEdgeCount(markCount);
     setScreen("output");
   };
@@ -1361,6 +1505,8 @@ function App() {
               numLayers={totalLayers}
               edges={edges}
               baselineOverlay={baselineOverlay}
+              regionMap={regionMap}
+              regionDepth={regionDepth}
               edgeConfigs={edgeConfigs}
               onSubmit={handleEdgeSubmit}
               onBack={handleBack}
@@ -1374,6 +1520,9 @@ function App() {
               selectedEdgeCount={selectedEdgeCount}
               markings={markings}
               objective={objective}
+              lambdaDepth={lambdaDepth}
+              connectivity={connectivity}
+              yMonotone={yMonotone}
               exportMode={exportMode}
               frameWidthIn={frameWidthIn}
               frameBorderIn={frameBorderIn}

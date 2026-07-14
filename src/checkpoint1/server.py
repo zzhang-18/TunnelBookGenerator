@@ -81,6 +81,14 @@ class SolveRequest(BaseModel):
     min_layer_area: float = 0.10      # cut objective (DEFAULT floor): force each layer to own >= this fraction of image area
     min_layer_regions: int = 0        # cut objective: optional count floor (>= k superpixels/layer); 0 = off (area floor is default)
     lambda_cut: float = 1.0           # cut objective: weight on the boundary-cut term
+    lambda_depth: float = 0.0         # cut objective: k-median depth-anchor strength (0 = pure cut;
+                                      # marks stop mattering above ~0.5, so the useful range is 0..0.5)
+    connectivity: bool = True         # flow (fabrication) constraints; off = pieces may float
+    connectivity_method: str = "flow"  # "flow" | "lazy" (cut-set rows added lazily at MIPSOL)
+    y_monotone: bool = False          # y == cumsum(x): "full backing" (fewer free binaries)
+    norel_time: float = 60.0          # cut objective: seconds of Gurobi NoRel heuristic (0 = off);
+                                      # rescues N>=4 incumbents (japan N=7: none -> comps 11, rho .90)
+    mip_focus: int = 1                # cut objective: Gurobi MIPFocus (1 = feasibility focus)
     cut_score: str = "laplacian"      # cut objective: "laplacian" | "meandiff"
     cut_log_sigma: float = 2.0        # cut objective: LoG spatial scale (px) for the crease score
 
@@ -225,18 +233,29 @@ def _build_cfg(req: "SolveRequest") -> Config:
     if req.objective == "cut":
         # soft splits are folded into the cut cost as zero-cost edges (build_model), so the
         # separate soft-split reward is off (lambda_split=0) to avoid double counting.
+        # lambda_depth > 0 blends in a k-median depth anchor (at 0 the term is off and the
+        # model is identical to the original pure-cut solve).
         return Config(n_layers=req.n_layers, fix_x=False,
-                      depth_model="bins", lambda_depth=0.0, lambda_support=0.0,
+                      depth_model="kmedian", lambda_depth=req.lambda_depth, lambda_support=0.0,
                       lambda_cut=req.lambda_cut, cut_cost="aware", cut_score=req.cut_score,
                       cut_log_sigma=req.cut_log_sigma,
                       use_contact_weight=True,  # kappa_e scales with shared-boundary length
                       min_layer_area=req.min_layer_area,
                       min_layer_regions=req.min_layer_regions,
+                      connectivity=req.connectivity,
+                      connectivity_method=req.connectivity_method,
+                      y_monotone=req.y_monotone,
+                      norel_time=req.norel_time, mip_focus=req.mip_focus,
                       lambda_split=0.0, mip_gap=0.02,
-                      time_limit=req.time_limit, verbose=False)
+                      time_limit=req.time_limit, verbose=False,
+                      log_progress=True)  # stream incumbents (+ z medians) to the console
+    # depth objective solves in seconds -- the NoRel/MIPFocus rescue is left off here
     return Config(n_layers=req.n_layers, fix_x=False, lambda_support=1.0,
                   lambda_split=req.lambda_split, mip_gap=0.01,
-                  time_limit=req.time_limit, verbose=False)
+                  connectivity=req.connectivity,
+                  connectivity_method=req.connectivity_method,
+                  y_monotone=req.y_monotone,
+                  time_limit=req.time_limit, verbose=False, log_progress=True)
 
 
 def _solve_layers(sess: dict, req: "SolveRequest"):
@@ -352,11 +371,22 @@ async def create_session(image: UploadFile = File(...), n_layers: int = Form(5))
     baseline = _data_url(_png_bytes(_overlay_img(inst, lhat1, rgb)))
     baseline_layers = [_data_url(_png_bytes(im)) for im in _layer_imgs(inst, lhat1, rgb)]
 
+    # lossless per-pixel positional-region-index map (idx+1: R = low byte, G = high byte,
+    # 0 = unmodeled pixel) so the frontend can hit-test regions under the cursor
+    lut = np.full(int(label_map.max()) + 1, -1, dtype=np.int64)
+    lut[np.asarray(inst.region_ids)] = np.arange(inst.n_regions)
+    idx1 = (lut[label_map] + 1).astype(np.uint16)
+    enc = np.zeros((*label_map.shape, 3), dtype=np.uint8)
+    enc[..., 0] = (idx1 & 0xFF).astype(np.uint8)
+    enc[..., 1] = (idx1 >> 8).astype(np.uint8)
+    region_map = _data_url(_png_bytes(enc))
+
     print(f"[create_session] {w}x{h} | regions={inst.n_regions} | edges={len(edges)}")
     return {
         "sessionId": session_id, "width": w, "height": h,
         "nLayers": n_layers, "nRegions": inst.n_regions,
         "edges": edges, "baselineOverlay": baseline, "baselineLayers": baseline_layers,
+        "regionMap": region_map, "regionDepth": [float(v) for v in inst.mean_depth],
         "datasetSlug": d.name, "edgeConfigs": list_edge_configs(d),
     }
 
@@ -384,6 +414,7 @@ async def solve_session(session_id: str, req: SolveRequest):
         "layers": [_data_url(_png_bytes(im)) for im in layer_imgs],
         "nLayers": req.n_layers, "objective": sol.obj_breakdown,
         "status": sol.status, "runtime": sol.runtime,
+        "z": sol.extra.get("z"), "layerOf": [int(v) for v in sol.layer_of],
     }
 
 
