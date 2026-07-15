@@ -60,6 +60,7 @@ from tunnelbook.data.realimage import compute_depth, segment_image
 from tunnelbook.data.sam_point import get_sam_predictor, predict_point_mask
 from tunnelbook.data.spam_segment import SAM_CHECKPOINT, segment_image_spam
 from tunnelbook.export import build_layer_ai_docs
+from tunnelbook.export.ai import _detect_texture_edges, _trace_skeleton
 from tunnelbook.model import build_model
 from tunnelbook.solve import InfeasibleError, solve
 
@@ -263,7 +264,11 @@ def _layer_masks(inst, sol, rgb: np.ndarray, max_dim: int = 512):
     paper = np.array([243, 240, 232], dtype=np.uint8)
     wash = np.array([203, 198, 188], dtype=np.float32)
     ink, red = (64, 60, 54), (198, 40, 40)
-    engrave = cv2.dilate(cv2.Canny(rgb, 30, 100), np.ones((2, 2), np.uint8)) > 0
+    # centerline engrave preview: same machinery as the .ai exporter's "centerline" style
+    # (visible-masked Canny -> skeleton -> single-burn polylines with a physical length floor),
+    # so the sheet texture shows what actually gets burned -- not the doubled Canny loops.
+    from skimage.morphology import skeletonize
+    min_len_px = max(2.0, 0.03 * W / 12.0)   # exporter default: min_engrave_in / content_width_in
     s = max_dim / (max(H, W) + 2 * band)
     photo_out, sheet_out = [], []
     for l in range(inst.n_layers):
@@ -276,7 +281,14 @@ def _layer_masks(inst, sol, rgb: np.ndarray, max_dim: int = 512):
         ph[..., 3] = np.where(mat, 255, 0).astype(np.uint8)
         sh = np.zeros((H, W, 4), dtype=np.uint8)
         sh[..., :3][mat] = paper
-        sh[..., :3][vis & engrave] = ink
+        emap = _detect_texture_edges(rgb, vis, 30, 100)
+        for chain in _trace_skeleton(skeletonize(emap > 0)):
+            if len(chain) < 2:
+                continue
+            seg = np.diff(chain, axis=0)
+            if np.hypot(seg[:, 0], seg[:, 1]).sum() < min_len_px:
+                continue
+            cv2.polylines(sh, [chain.round().astype(np.int32)], False, (*ink, 255), 2)
         cut = cv2.morphologyEx(mat.astype(np.uint8), cv2.MORPH_GRADIENT,
                                np.ones((3, 3), np.uint8)) > 0
         sh[..., :3][cut] = red
@@ -684,9 +696,11 @@ async def export_ai(session_id: str, req: ExportLayersRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
+        # centerline engrave (single-burn skeleton strokes) -- matches run_one's sweep exports
+        # and the 3D preview's sheet texture; "canny" loops burn every edge twice
         docs = build_layer_ai_docs(sol, content_width_in=req.content_width_in,
                                    engrave=(req.mode == "engraving"), border_in=req.border_in,
-                                   rgb=sess["rgb"])
+                                   rgb=sess["rgb"], engrave_style="centerline")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Layer export failed: {e}")
 
