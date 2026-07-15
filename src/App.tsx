@@ -242,6 +242,7 @@ async function solveSession(
   norelTime: number,
   mipFocus: number,
   lambdaCoherence: number,
+  minLayerArea: number,
 ): Promise<SolveResult> {
   const res = await fetch(apiUrl(`/api/sessions/${sessionId}/solve`), {
     method: "POST",
@@ -251,7 +252,7 @@ async function solveSession(
       cut_log_sigma: cutLogSigma, lambda_depth: lambdaDepth,
       connectivity, y_monotone: yMonotone,
       connectivity_method: connectivityMethod, norel_time: norelTime, mip_focus: mipFocus,
-      lambda_coherence: lambdaCoherence,
+      lambda_coherence: lambdaCoherence, min_layer_area: minLayerArea,
     }),
   });
   if (!res.ok)
@@ -355,6 +356,7 @@ async function exportLayers(
   norelTime: number,
   mipFocus: number,
   lambdaCoherence: number,
+  minLayerArea: number,
   mode: ExportMode,
   contentWidthIn: number,
   borderIn: number,
@@ -366,7 +368,7 @@ async function exportLayers(
       markings, n_layers: nLayers, objective, lambda_depth: lambdaDepth,
       connectivity, y_monotone: yMonotone,
       connectivity_method: connectivityMethod, norel_time: norelTime, mip_focus: mipFocus,
-      lambda_coherence: lambdaCoherence,
+      lambda_coherence: lambdaCoherence, min_layer_area: minLayerArea,
       mode, content_width_in: contentWidthIn, border_in: borderIn,
     }),
   });
@@ -379,21 +381,11 @@ async function exportLayers(
 
 // ─── Shared UI primitives ─────────────────────────────────────────────────────
 
-function Stars() {
-  return (
-    <div className="stars" aria-hidden="true">
-      {[...Array(20)].map((_, i) => (
-        <div key={i} className={`star star-${i + 1}`} />
-      ))}
-    </div>
-  );
-}
-
 function HelpModal({ onClose }: { onClose: () => void }) {
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-        <button className="modal-close" onClick={onClose}>x</button>
+        <button className="modal-close" onClick={onClose}>×</button>
         <div className="modal-title"><I.Sparkles /> How It Works</div>
         <div className="modal-step">
           <div className="modal-step-label"><I.Upload /> step 1 — Upload</div>
@@ -446,8 +438,8 @@ function Sidebar({
           onKeyDown={(e) => e.key === "Enter" && onGoHome()}
         >
           <I.Home />
-          <span className="sidebar-tab-label">upload</span>
-          {screen !== "home" && <div className="sidebar-tab-dot" style={{ background: "#6366f1" }} />}
+          <span className="sidebar-tab-label">Upload</span>
+          {screen !== "home" && <div className="sidebar-tab-dot" style={{ background: "var(--text-lo)" }} />}
         </div>
 
         {screen !== "home" && (
@@ -456,9 +448,9 @@ function Sidebar({
           >
             <div
               className="sidebar-tab-dot"
-              style={{ background: screen === "output" ? "#22c55e" : "#6366f1" }}
+              style={{ background: screen === "output" ? "var(--ink)" : "var(--text-lo)" }}
             />
-            <span className="sidebar-tab-label">edges</span>
+            <span className="sidebar-tab-label">Edges</span>
             {screen === "output" && (
               <span className="sidebar-tab-check"><I.Check /></span>
             )}
@@ -469,13 +461,13 @@ function Sidebar({
         {screen === "output" && (
           <div className="sidebar-tab sidebar-tab--active sidebar-tab--output">
             <I.CheckCircle size={13} />
-            <span className="sidebar-tab-label">output</span>
+            <span className="sidebar-tab-label">Output</span>
           </div>
         )}
       </nav>
       <div className="sidebar-footer">
         <span className="sidebar-status">
-          {screen === "home" ? "ready" : screen === "edges" ? "selecting" : "complete"}
+          {screen === "home" ? "Ready" : screen === "edges" ? "Selecting" : "Complete"}
         </span>
       </div>
     </aside>
@@ -553,7 +545,7 @@ function HomeScreen({
   return (
     <div className="home-screen">
       <div className="home-hero">
-        <div className="home-tag">// AI-powered layer segmentation</div>
+        <div className="home-tag">Photo to laser-cut tunnel book</div>
         <h1 className="home-title">
           Tunnel<span className="home-title-accent">Book</span>
           <span className="home-title-small"> Generator</span>
@@ -753,7 +745,7 @@ function HomeScreen({
 
       {error && (
         <div className="error-banner">
-          <span className="error-banner-tag">// error</span> {error}
+          <span className="error-banner-tag">Error</span> {error}
           <div className="error-banner-sub">
             Ensure the Python server is running and Vite proxies <code>/api</code>.
           </div>
@@ -852,7 +844,7 @@ function BookVisualizer({ masks, sheetMasks }: { masks: string[]; sheetMasks?: s
                   pointerEvents: "none",
                   transform: `translateZ(${(N - 1 - i) * GAP}px)`,
                   zIndex: N - i,
-                  filter: "drop-shadow(0 3px 10px rgba(0,0,0,0.5))",
+                  filter: "drop-shadow(0 3px 10px rgba(0,0,0,0.25))",
                 }}
               />
             ),
@@ -887,7 +879,7 @@ function BookVisualizer({ masks, sheetMasks }: { masks: string[]; sheetMasks?: s
                 style={{
                   width: "auto", padding: "0 8px", fontSize: 9,
                   fontFamily: "var(--font-mono)",
-                  color: tex === t ? "#22d3ee" : undefined,
+                  color: tex === t ? "var(--ink)" : undefined,
                   fontWeight: tex === t ? 700 : 400,
                 }}
               >
@@ -914,7 +906,7 @@ function BookVisualizer({ masks, sheetMasks }: { masks: string[]; sheetMasks?: s
               style={{ opacity: on ? 1 : 0.5 }}
             >
               <div className="viz-layer-swatch" style={{ background: heatColor(N > 1 ? i / (N - 1) : 0) }} />
-              <span className="viz-layer-name">layer_{String(i + 1).padStart(2, "0")}</span>
+              <span className="viz-layer-name">Layer {i + 1}</span>
               <I.Eye />
             </button>
           );
@@ -959,6 +951,7 @@ function EdgeSelectionScreen({
     norelTime: number,
     mipFocus: number,
     lambdaCoherence: number,
+    minLayerArea: number,
   ) => void;
   onBack: () => void;
 }) {
@@ -976,6 +969,8 @@ function EdgeSelectionScreen({
   // validated weight when toggled on
   const [cohOn, setCohOn] = useState(false);
   const [lambdaCoh, setLambdaCoh] = useState(0.05);
+  // per-layer visible-area floor — mirrors SolveRequest.min_layer_area (cut objective)
+  const [minLayerArea, setMinLayerArea] = useState(0.10);
   const [logSigma, setLogSigma] = useState(2.0);
   // per-pixel positional region index decoded from regionMap (idx+1 in R + G<<8; 0 = none)
   const regionIdxRef = useRef<{ data: Uint8ClampedArray; w: number; h: number } | null>(null);
@@ -998,9 +993,9 @@ function EdgeSelectionScreen({
   const [selectObjectError, setSelectObjectError] = useState<string | null>(null);
 
   const TOOLS: { key: MarkType; label: string; color: string }[] = [
-    { key: "split_soft", label: "split · soft", color: "#f59e0b" },
-    { key: "split_hard", label: "split · hard", color: "#ef4444" },
-    { key: "delete", label: "delete", color: "#3b82f6" },
+    { key: "split_soft", label: "Soft split", color: "#f59e0b" },
+    { key: "split_hard", label: "Hard split", color: "#ef4444" },
+    { key: "delete", label: "Delete", color: "#3b82f6" },
   ];
   const colorOf = (m: MarkType) => TOOLS.find((t) => t.key === m)!.color;
 
@@ -1159,7 +1154,7 @@ function EdgeSelectionScreen({
     setIsSolving(true);
     setSolveError(null);
     try {
-      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence);
+      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea);
       setOverlay(r.overlay);
       setResult(r);
     } catch (err: any) {
@@ -1203,8 +1198,8 @@ function EdgeSelectionScreen({
           <I.ChevronLeft /> back
         </button>
         <div className="layer-topbar-center">
-          <div className="layer-badge" style={{ background: "#6366f1" }}>
-            mark_boundaries
+          <div className="layer-badge" style={{ background: "var(--ink)" }}>
+            Mark boundaries
           </div>
           <span className="layer-of">{numLayers} layers · {edges.length} boundaries</span>
         </div>
@@ -1240,11 +1235,11 @@ function EdgeSelectionScreen({
             <button
               className="ctrl-btn ctrl-btn--ghost"
               onClick={() => setObjectSelectMode((v) => !v)}
-              title="Click a point on the photo to run SAM and mark every boundary tracing that object's outline as split · soft -- leaves your existing marks untouched. SAM warms up during upload, so clicks are normally fast; occasionally the first one on a fresh server still needs a moment."
+              title="Click a point on the photo to run SAM and mark every boundary tracing that object's outline as a soft split -- leaves your existing marks untouched. SAM warms up during upload, so clicks are normally fast; occasionally the first one on a fresh server still needs a moment."
               style={{
                 marginLeft: "auto",
-                borderColor: objectSelectMode ? "#34d399" : "transparent",
-                color: objectSelectMode ? "#34d399" : "var(--text-dim)",
+                borderColor: objectSelectMode ? "var(--ink)" : "transparent",
+                color: objectSelectMode ? "var(--ink)" : "var(--text-dim)",
                 fontWeight: objectSelectMode ? 700 : 400,
               }}
             >
@@ -1256,7 +1251,7 @@ function EdgeSelectionScreen({
             <button
               className="ctrl-btn ctrl-btn--ghost"
               onClick={handleAutoSelect}
-              title="Mark this image's strongest ~20% of boundaries (by depth discontinuity or Canny edge alignment) as split · soft (a suggestion, not a forced cut) -- leaves your existing marks untouched"
+              title="Mark this image's strongest ~20% of boundaries (by depth discontinuity or Canny edge alignment) as soft splits (a suggestion, not a forced cut) -- leaves your existing marks untouched"
             >
               <I.Sparkles size={11} /> auto select edges
             </button>
@@ -1275,8 +1270,8 @@ function EdgeSelectionScreen({
                   ? "depth-aware boundary cut only (>=5 spx/layer); your edge marks drive the splits"
                   : "fixed depth-bin fidelity (baseline)"}
                 style={{
-                  borderColor: objective === o.key ? "#22d3ee" : "transparent",
-                  color: objective === o.key ? "#22d3ee" : "var(--text-dim)",
+                  borderColor: objective === o.key ? "var(--ink)" : "transparent",
+                  color: objective === o.key ? "var(--ink)" : "var(--text-dim)",
                   fontWeight: objective === o.key ? 700 : 400,
                 }}
               >
@@ -1293,6 +1288,19 @@ function EdgeSelectionScreen({
                   type="range" min={0} max={1} step={0.05} value={lambdaDepth}
                   onChange={(ev) => setLambdaDepth(Number(ev.target.value))}
                   style={{ width: 110 }}
+                />
+              </label>
+            )}
+            {objective === "cut" && (
+              <label
+                title="Area floor: every layer must own at least this fraction of the image (0 = off). If the background dominates the photo, a high floor forces far content to be carved across layers — lower it (5%) to let sky/mountains consolidate"
+                style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)" }}
+              >
+                area floor {(minLayerArea * 100).toFixed(0)}%
+                <input
+                  type="range" min={0} max={0.2} step={0.01} value={minLayerArea}
+                  onChange={(ev) => setMinLayerArea(Number(ev.target.value))}
+                  style={{ width: 90 }}
                 />
               </label>
             )}
@@ -1394,7 +1402,7 @@ function EdgeSelectionScreen({
               onChange={(e) => setConfigName(e.target.value.replace(/[^A-Za-z0-9._-]/g, ""))}
               style={{
                 width: 130, padding: "4px 8px", borderRadius: 6,
-                border: "1px solid var(--border-dim)", background: "rgba(0,0,0,0.3)",
+                border: "1px solid var(--border-dim)", background: "var(--bg-card)",
                 color: "var(--text-mid)", fontFamily: "var(--font-mono)", fontSize: 11,
               }}
             />
@@ -1411,7 +1419,7 @@ function EdgeSelectionScreen({
               onChange={(e) => setSelectedConfig(e.target.value)}
               style={{
                 maxWidth: 180, padding: "4px 6px", borderRadius: 6,
-                border: "1px solid var(--border-dim)", background: "rgba(0,0,0,0.3)",
+                border: "1px solid var(--border-dim)", background: "var(--bg-card)",
                 color: "var(--text-mid)", fontFamily: "var(--font-mono)", fontSize: 11,
               }}
             >
@@ -1437,7 +1445,7 @@ function EdgeSelectionScreen({
         {/* canvas-wrap is sized to the image; SVG overlays it 1:1 */}
         <div
           className="canvas-wrap"
-          style={{ position: "relative", background: "#0b0b12" }}
+          style={{ position: "relative", background: "#141311" }}
           onMouseMove={handleRegionHover}
           onMouseLeave={() => setHoverRegion(null)}
         >
@@ -1462,10 +1470,11 @@ function EdgeSelectionScreen({
               ...(hoverRegion.py > hoverRegion.h / 2
                 ? { bottom: hoverRegion.h - hoverRegion.py + 14 }
                 : { top: hoverRegion.py + 14 }),
-              pointerEvents: "none", zIndex: 5, background: "rgba(10,10,18,0.92)",
-              border: "1px solid rgba(255,255,255,0.18)", borderRadius: 6,
-              padding: "6px 8px", fontSize: 11, fontFamily: "monospace",
-              color: "var(--text-dim)", whiteSpace: "pre", lineHeight: 1.5,
+              pointerEvents: "none", zIndex: 5, background: "rgba(253,252,249,0.96)",
+              border: "1px solid var(--border-bright)", borderRadius: 4,
+              padding: "6px 8px", fontSize: 11, fontFamily: "var(--font-mono)",
+              color: "var(--text-mid)", whiteSpace: "pre", lineHeight: 1.5,
+              boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
             }}>
               {(() => {
                 const d = regionDepth[hoverRegion.idx];
@@ -1560,7 +1569,7 @@ function EdgeSelectionScreen({
             </div>
           </div>
         </div>
-        <div className="canvas-wrap" style={{ position: "relative", background: "#07070c" }}>
+        <div className="canvas-wrap" style={{ position: "relative", background: "#101010" }}>
           <div style={{ width: "100%", aspectRatio: `${sessionWidth} / ${sessionHeight}` }} />
           <svg
             style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
@@ -1614,13 +1623,13 @@ function EdgeSelectionScreen({
       <div className="layer-controls">
         <div className="layer-controls-left">
           <div className="points-pill" style={{ color: "#f59e0b", borderColor: "#f59e0b44" }}>
-            {counts.split_soft} split·soft
+            {counts.split_soft} soft splits
           </div>
           <div className="points-pill" style={{ color: "#ef4444", borderColor: "#ef444444" }}>
-            {counts.split_hard} split·hard
+            {counts.split_hard} hard splits
           </div>
           <div className="points-pill" style={{ color: "#3b82f6", borderColor: "#3b82f644" }}>
-            {counts.delete} delete
+            {counts.delete} deletes
           </div>
           {result && (
             <div className="points-pill">
@@ -1633,7 +1642,7 @@ function EdgeSelectionScreen({
           {solveError && <span className="seg-error-inline">// {solveError}</span>}
           <button
             className="ctrl-btn ctrl-btn--ghost"
-            onClick={() => onSubmit(markingsArray(), objective, markCount, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence)}
+            onClick={() => onSubmit(markingsArray(), objective, markCount, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea)}
           >
             export →
           </button>
@@ -1666,6 +1675,7 @@ function OutputScreen({
   norelTime,
   mipFocus,
   lambdaCoherence,
+  minLayerArea,
   exportMode,
   frameWidthIn,
   frameBorderIn,
@@ -1684,6 +1694,7 @@ function OutputScreen({
   norelTime: number;
   mipFocus: number;
   lambdaCoherence: number;
+  minLayerArea: number;
   exportMode: ExportMode;
   frameWidthIn: number;
   frameBorderIn: number;
@@ -1733,7 +1744,7 @@ function OutputScreen({
         await exportLayers(
           sessionId, markings, numLayers, objective, lambdaDepth,
           connectivity, yMonotone, connectivityMethod, norelTime, mipFocus,
-          lambdaCoherence,
+          lambdaCoherence, minLayerArea,
           exportMode, frameWidthIn, frameBorderIn,
         ),
       );
@@ -1751,7 +1762,7 @@ function OutputScreen({
           <I.ChevronLeft /> back
         </button>
         <div className="output-title">
-          <I.CheckCircle /> <span>edges_saved</span>
+          <I.CheckCircle /> <span>Edges saved</span>
         </div>
         <div className="output-badge">{numLayers} layers</div>
       </div>
@@ -1764,7 +1775,7 @@ function OutputScreen({
             <div className="output-info">
               <span className="output-filename">{selectedEdgeCount} cut edge{selectedEdgeCount !== 1 ? "s" : ""} selected</span>
               <div className="output-meta">
-                <span className="output-layer-tag">step_1 complete</span>
+                <span className="output-layer-tag">Step 1 complete</span>
                 <span className="output-mode-tag"><I.Scissors /> outline</span>
               </div>
             </div>
@@ -1783,7 +1794,7 @@ function OutputScreen({
           disabled={isExportingLayers || !sessionId}
           title={`Solve and export all ${numLayers} layer sheets as .ai (${exportMode})`}
         >
-          <I.Layers /> {isExportingLayers ? "solving…" : "export_layers.zip"}
+          <I.Layers /> {isExportingLayers ? "Solving…" : "Export layers (.zip)"}
         </button>
         <button
           className="action-btn action-btn--stand"
@@ -1791,18 +1802,18 @@ function OutputScreen({
           disabled={isExportingStand || !sessionId}
           title={`Generate a ${numLayers}-slot laser-cut stand`}
         >
-          <I.DownloadCloud /> {isExportingStand ? "generating…" : "export_stand.ai"}
+          <I.DownloadCloud /> {isExportingStand ? "Generating…" : "Export stand (.ai)"}
         </button>
       </div>
 
       {layersError && (
         <div className="error-banner">
-          <span className="error-banner-tag">// error</span> {layersError}
+          <span className="error-banner-tag">Error</span> {layersError}
         </div>
       )}
       {standError && (
         <div className="error-banner">
-          <span className="error-banner-tag">// error</span> {standError}
+          <span className="error-banner-tag">Error</span> {standError}
         </div>
       )}
     </div>
@@ -1839,6 +1850,7 @@ function App() {
   const [norelTime, setNorelTime] = useState(60);
   const [mipFocus, setMipFocus] = useState(1);
   const [lambdaCoherence, setLambdaCoherence] = useState(0);
+  const [minLayerArea, setMinLayerArea] = useState(0.10);
   const [regionMap, setRegionMap] = useState<string | null>(null);
   const [regionDepth, setRegionDepth] = useState<number[]>([]);
 
@@ -1906,6 +1918,7 @@ function App() {
     norel: number,
     focus: number,
     lambdaCoh: number,
+    minArea: number,
   ) => {
     setMarkings(marks);
     setObjective(obj);
@@ -1914,6 +1927,7 @@ function App() {
     setYMonotone(yMono);
     setConnectivityMethod(connMethod);
     setLambdaCoherence(lambdaCoh);
+    setMinLayerArea(minArea);
     setNorelTime(norel);
     setMipFocus(focus);
     setSelectedEdgeCount(markCount);
@@ -1927,7 +1941,6 @@ function App() {
 
   return (
     <div className="app-root">
-      <Stars />
       <Sidebar screen={screen} onGoHome={handleBack} />
       <main className="app-main">
         <div className="main-inner">
@@ -1970,6 +1983,7 @@ function App() {
               norelTime={norelTime}
               mipFocus={mipFocus}
               lambdaCoherence={lambdaCoherence}
+              minLayerArea={minLayerArea}
               exportMode={exportMode}
               frameWidthIn={frameWidthIn}
               frameBorderIn={frameBorderIn}
