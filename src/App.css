@@ -1541,6 +1541,19 @@ body {
   border-bottom: 1px solid var(--border-dim);
 }
 
+.canvas-tools--stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.canvas-tools-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 .canvas-tools-hint {
   font-size: 11px;
   color: var(--text-lo);
@@ -1709,6 +1722,8 @@ body {
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
   cursor: pointer;
   transition: all 0.15s;
 }

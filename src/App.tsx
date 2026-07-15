@@ -36,8 +36,15 @@ function heatColor(t: number): string {
 
 type ExportMode = "outline" | "engraving";
 type Screen = "home" | "edges" | "output";
+// Fraction of edges "auto select edges" marks, ranked by depth-edge score (see EdgeItem.score).
+// Scores are min-max normalized per image (1.0 = that image's single strongest depth
+// discontinuity), so an absolute cutoff is unreliable: one dominant edge can leave every other
+// real boundary far below it. A percentile-of-that-image cutoff self-calibrates instead.
+const AUTO_SELECT_TOP_FRACTION = 0.2;
 type MarkType = "split_soft" | "split_hard" | "delete";
-type EdgeItem = { index: number; i: number; j: number; segments: number[][]; score?: number };
+type EdgeItem = {
+  index: number; i: number; j: number; segments: number[][]; score?: number; cannyAlign?: number;
+};
 type EdgeConfigItem = {
   name: string;
   created: string | null;
@@ -200,10 +207,15 @@ const I = {
 
 // ─── API functions ─────────────────────────────────────────────────────────────
 
-async function createSession(imageFile: File, nLayers: number): Promise<SessionData> {
+async function createSession(
+  imageFile: File,
+  nLayers: number,
+  edgeCondition: boolean,
+): Promise<SessionData> {
   const fd = new FormData();
   fd.append("image", imageFile);
   fd.append("n_layers", String(nLayers));
+  fd.append("edge_condition", String(edgeCondition));
   const res = await fetch(apiUrl("/api/sessions"), { method: "POST", body: fd });
   if (!res.ok)
     throw new Error(
@@ -250,6 +262,21 @@ async function fetchScores(
   });
   if (!res.ok) throw new Error(`scores failed (${res.status})`);
   return (await res.json()).scores as number[];
+}
+
+async function selectObject(
+  sessionId: string,
+  x: number,
+  y: number,
+): Promise<{ edgeIndices: number[]; score: number }> {
+  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/select-object`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ x, y }),
+  });
+  if (!res.ok)
+    throw new Error((await res.text().catch(() => "")) || `Select object failed (${res.status})`);
+  return res.json();
 }
 
 async function saveEdgeConfig(
@@ -448,7 +475,11 @@ function HomeScreen({
   exportMode,
   onExportModeChange,
 }: {
-  onGo: (f: File, url: string, n: number, frameWidthIn: number, frameHeightIn: number, frameBorderIn: number) => void;
+  onGo: (
+    f: File, url: string, n: number,
+    frameWidthIn: number, frameHeightIn: number, frameBorderIn: number,
+    edgeCondition: boolean,
+  ) => void;
   isStarting: boolean;
   error: string | null;
   exportMode: ExportMode;
@@ -460,6 +491,7 @@ function HomeScreen({
   const [frameWidthIn, setFrameWidthIn] = useState("12");
   const [frameHeightIn, setFrameHeightIn] = useState("9");
   const [frameBorderIn, setFrameBorderIn] = useState("0.5");
+  const [edgeCondition, setEdgeCondition] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -596,16 +628,34 @@ function HomeScreen({
           className={`go-btn ${canGo ? "go-btn--active" : "go-btn--disabled"}`}
           onClick={() => {
             if (canGo && imageFile && imageUrl)
-              onGo(imageFile, imageUrl, parsed, parsedW, parsedH, parsedB);
+              onGo(imageFile, imageUrl, parsed, parsedW, parsedH, parsedB, edgeCondition);
           }}
           disabled={!canGo}
         >
           {isStarting ? (
-            <><span className="go-btn-spinner" /> detecting edges…</>
+            <><span className="go-btn-spinner" /> detecting edges & preparing SAM…</>
           ) : (
             <>run <I.ArrowRight /></>
           )}
         </button>
+      </div>
+
+      {/* ── Row 1b: edge conditioning ── */}
+      <div className="config-row">
+        <label
+          className="config-label"
+          style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}
+        >
+          <input
+            type="checkbox"
+            checked={edgeCondition}
+            onChange={(e) => setEdgeCondition(e.target.checked)}
+          />
+          <I.Brush size={12} /> condition boundaries on detected edges
+        </label>
+        <span className="frame-summary-note" style={{ fontSize: 11, color: "var(--text-dim)" }}>
+          splits superpixels along real Canny object edges, not just the segmentation tessellation
+        </span>
       </div>
 
       {/* ── Row 2: frame dimensions ── */}
@@ -753,6 +803,10 @@ function EdgeSelectionScreen({
   const [selectedConfig, setSelectedConfig] = useState("");
   const [configBusy, setConfigBusy] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
+  // point-prompted SAM "select object": click the photo (not an edge) to mark its outline
+  const [objectSelectMode, setObjectSelectMode] = useState(false);
+  const [isSelectingObject, setIsSelectingObject] = useState(false);
+  const [selectObjectError, setSelectObjectError] = useState<string | null>(null);
 
   const TOOLS: { key: MarkType; label: string; color: string }[] = [
     { key: "split_soft", label: "split · soft", color: "#f59e0b" },
@@ -782,6 +836,65 @@ function EdgeSelectionScreen({
   // crease strength per edge: live-recomputed override (slider) or the session baseline
   const scoreOf = (e: EdgeItem) =>
     scoreOverride ? scoreOverride[e.index] ?? 0 : e.score ?? 0;
+
+  // Boundary "realness" = whichever is stronger: the depth-edge score, or how much the boundary
+  // coincides with a detected Canny edge (cannyAlign, independent of depth -- see server.py). A
+  // silhouette can be visually sharp but sit on a smooth/noisy stretch of the depth estimate, so
+  // depth score alone misses it; taking the max lets either signal carry a real edge.
+  const boundaryStrength = (e: EdgeItem) => Math.max(scoreOf(e), e.cannyAlign ?? 0);
+
+  // Ranks edges by strength * sqrt(boundary length) rather than strength alone, then marks the
+  // top AUTO_SELECT_TOP_FRACTION as split_soft -- a suggestion, not a forced cut, so the solver
+  // still decides. Both signals are medians/fractions over the boundary's pixels, so a short,
+  // spiky (often noisy) sliver can outscore a long, genuinely significant boundary (e.g. a
+  // mountain ridge) purely because there's less to average over; weighting by length keeps long
+  // real boundaries competitive. Rank-based (not an absolute cutoff) so it adapts to each image's
+  // own distribution. Existing marks are left untouched: this only fills in unmarked edges.
+  const weightOf = (e: EdgeItem) => boundaryStrength(e) * Math.sqrt(Math.max(1, e.segments.length));
+
+  const handleAutoSelect = () => {
+    if (edges.length === 0) return;
+    const k = Math.max(1, Math.ceil(edges.length * AUTO_SELECT_TOP_FRACTION));
+    const top = new Set(
+      [...edges].sort((a, b) => weightOf(b) - weightOf(a)).slice(0, k).map((e) => e.index),
+    );
+    setMarks((prev) => {
+      const next = { ...prev };
+      edges.forEach((e) => {
+        if (next[e.index] === undefined && top.has(e.index)) {
+          next[e.index] = "split_soft";
+        }
+      });
+      return next;
+    });
+  };
+
+  // "select object" (point-prompted SAM): active only when objectSelectMode is on, and only for
+  // clicks that reach the svg background (edge <g>s stopPropagation on their own clicks). Maps
+  // the click to image-pixel coords via the svg's rendered size vs. its viewBox, matching the
+  // convention every edge segment is already in.
+  const handleObjectClick = async (ev: React.MouseEvent<SVGSVGElement>) => {
+    if (!objectSelectMode || isSelectingObject) return;
+    const rect = ev.currentTarget.getBoundingClientRect();
+    const x = ((ev.clientX - rect.left) / rect.width) * sessionWidth;
+    const y = ((ev.clientY - rect.top) / rect.height) * sessionHeight;
+    setIsSelectingObject(true);
+    setSelectObjectError(null);
+    try {
+      const { edgeIndices } = await selectObject(sessionId, x, y);
+      setMarks((prev) => {
+        const next = { ...prev };
+        edgeIndices.forEach((i) => {
+          if (next[i] === undefined) next[i] = "split_soft";
+        });
+        return next;
+      });
+    } catch (err: any) {
+      setSelectObjectError(err?.message ?? "Select object failed");
+    } finally {
+      setIsSelectingObject(false);
+    }
+  };
 
   // value the crease map colours by = "cuttability" (low cut cost). A soft mark sets the cut
   // cost to 0, so it reads as maximally cuttable (brightest); depth creases fall out naturally.
@@ -903,8 +1016,8 @@ function EdgeSelectionScreen({
       </div>
 
       <div className="canvas-card">
-        <div className="canvas-tools">
-          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <div className="canvas-tools canvas-tools--stacked">
+          <div className="canvas-tools-row">
             <span className="canvas-tools-hint" style={{ marginRight: 4 }}>
               <I.Brush /> tool:
             </span>
@@ -926,8 +1039,31 @@ function EdgeSelectionScreen({
                 {t.label}
               </button>
             ))}
+            <button
+              className="ctrl-btn ctrl-btn--ghost"
+              onClick={() => setObjectSelectMode((v) => !v)}
+              title="Click a point on the photo to run SAM and mark every boundary tracing that object's outline as split · soft -- leaves your existing marks untouched. SAM warms up during upload, so clicks are normally fast; occasionally the first one on a fresh server still needs a moment."
+              style={{
+                marginLeft: "auto",
+                borderColor: objectSelectMode ? "#34d399" : "transparent",
+                color: objectSelectMode ? "#34d399" : "var(--text-dim)",
+                fontWeight: objectSelectMode ? 700 : 400,
+              }}
+            >
+              {isSelectingObject ? <span className="go-btn-spinner" /> : <I.Sparkles size={11} />}
+              {isSelectingObject
+                ? "segmenting…"
+                : objectSelectMode ? "click an object…" : "select object"}
+            </button>
+            <button
+              className="ctrl-btn ctrl-btn--ghost"
+              onClick={handleAutoSelect}
+              title="Mark this image's strongest ~20% of boundaries (by depth discontinuity or Canny edge alignment) as split · soft (a suggestion, not a forced cut) -- leaves your existing marks untouched"
+            >
+              <I.Sparkles size={11} /> auto select edges
+            </button>
           </div>
-          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <div className="canvas-tools-row">
             <span className="canvas-tools-hint" style={{ marginRight: 4 }}>objective:</span>
             {([
               { key: "depth", label: "depth fit" },
@@ -982,14 +1118,15 @@ function EdgeSelectionScreen({
               />
               full backing
             </label>
+            <button
+              className="ctrl-btn ctrl-btn--ghost"
+              onClick={() => setMarks({})}
+              disabled={markCount === 0}
+              style={{ marginLeft: "auto" }}
+            >
+              clear all
+            </button>
           </div>
-          <button
-            className="ctrl-btn ctrl-btn--ghost"
-            onClick={() => setMarks({})}
-            disabled={markCount === 0}
-          >
-            clear all
-          </button>
         </div>
 
         {/* named edge configs: save/load the current marks into the session's dataset dir */}
@@ -1086,9 +1223,13 @@ function EdgeSelectionScreen({
             </div>
           )}
           <svg
-            style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
+            style={{
+              position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
+              cursor: objectSelectMode ? (isSelectingObject ? "wait" : "crosshair") : undefined,
+            }}
             viewBox={`0 0 ${sessionWidth} ${sessionHeight}`}
             preserveAspectRatio="none"
+            onClick={handleObjectClick}
           >
             {edges.map((e) => {
               const m = marks[e.index];
@@ -1096,7 +1237,7 @@ function EdgeSelectionScreen({
               return (
                 <g
                   key={e.index}
-                  onClick={() => applyMark(e.index)}
+                  onClick={(ev) => { ev.stopPropagation(); applyMark(e.index); }}
                   onMouseEnter={() => setHoveredIdx(e.index)}
                   onMouseLeave={() => setHoveredIdx(null)}
                   style={{ cursor: "pointer" }}
@@ -1119,25 +1260,29 @@ function EdgeSelectionScreen({
 
       {/* crease map: live heatmap of per-boundary depth-edge strength (the cut score) */}
       <div className="canvas-card">
-        <div className="canvas-tools">
-          <span className="canvas-tools-hint" style={{ marginRight: 4 }}>
-            <I.Brush /> crease map — cut-cost field · soft marks read as free · click to mark
-          </span>
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)" }}>
-            LoG σ {logSigma.toFixed(1)}px
-            <input
-              type="range" min={0.5} max={8} step={0.5} value={logSigma}
-              onChange={(ev) => setLogSigma(Number(ev.target.value))}
-              style={{ width: 110 }}
-            />
-          </label>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "var(--text-dim)" }}>
-            <span>costly to cut</span>
-            <span style={{
-              width: 120, height: 8, borderRadius: 4, display: "inline-block",
-              background: "linear-gradient(90deg, rgb(12,14,40), rgb(84,24,120), rgb(201,44,92), rgb(246,130,32), rgb(255,240,130))",
-            }} />
-            <span>free · crease</span>
+        <div className="canvas-tools canvas-tools--stacked">
+          <div className="canvas-tools-row">
+            <span className="canvas-tools-hint" style={{ fontSize: 12 }}>
+              <I.Brush /> crease map — cut-cost field · soft marks read as free · click to mark
+            </span>
+          </div>
+          <div className="canvas-tools-row">
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)" }}>
+              LoG σ {logSigma.toFixed(1)}px
+              <input
+                type="range" min={0.5} max={8} step={0.5} value={logSigma}
+                onChange={(ev) => setLogSigma(Number(ev.target.value))}
+                style={{ width: 110 }}
+              />
+            </label>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "var(--text-dim)", marginLeft: "auto" }}>
+              <span>costly to cut</span>
+              <span style={{
+                width: 120, height: 8, borderRadius: 4, display: "inline-block",
+                background: "linear-gradient(90deg, rgb(12,14,40), rgb(84,24,120), rgb(201,44,92), rgb(246,130,32), rgb(255,240,130))",
+              }} />
+              <span>free · crease</span>
+            </div>
           </div>
         </div>
         <div className="canvas-wrap" style={{ position: "relative", background: "#07070c" }}>
@@ -1156,7 +1301,7 @@ function EdgeSelectionScreen({
                 return (
                   <g
                     key={e.index}
-                    onClick={() => applyMark(e.index)}
+                    onClick={(ev) => { ev.stopPropagation(); applyMark(e.index); }}
                     onMouseEnter={() => setHoveredIdx(e.index)}
                     onMouseLeave={() => setHoveredIdx(null)}
                     style={{ cursor: "pointer" }}
@@ -1209,6 +1354,7 @@ function EdgeSelectionScreen({
           )}
         </div>
         <div className="layer-controls-right">
+          {selectObjectError && <span className="seg-error-inline">// {selectObjectError}</span>}
           {solveError && <span className="seg-error-inline">// {solveError}</span>}
           <button
             className="ctrl-btn ctrl-btn--ghost"
@@ -1433,6 +1579,7 @@ function App() {
     fwIn: number,
     fhIn: number,
     fbIn: number,
+    edgeCondition: boolean,
   ) => {
     setFrameWidthIn(fwIn);
     setFrameHeightIn(fhIn);
@@ -1440,7 +1587,7 @@ function App() {
     setBackendError(null);
     setIsStarting(true);
     try {
-      const data = await createSession(file, count);
+      const data = await createSession(file, count, edgeCondition);
       setImageFile(file);
       setImageUrl(url);
       setTotalLayers(count);

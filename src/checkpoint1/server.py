@@ -4,9 +4,15 @@ Flow:
   POST /api/sessions        upload image -> resize -> datasets/ cache lookup by content hash
                             (frozen segmentation + depth from tunnelbook.data.dataset; on miss
                             compute (cached) SPAM superpixels + depth, then save a new dataset)
-                            -> ProblemInstance -> per-boundary segments + baseline layer solve.
+                            -> optional Canny edge-conditioning (tunnelbook.data.edges) so
+                            boundaries follow real object edges, not just the superpixel
+                            tessellation -> ProblemInstance -> per-boundary segments + baseline
+                            layer solve -> SAM image embedding warmed up here too (best-effort)
+                            so the first "select object" click isn't the one paying that cost.
   POST /api/sessions/{id}/solve   mark boundaries split_soft/split_hard/delete -> build the
                             MIP with those terms -> solve -> return a layer-assignment preview.
+  POST /api/sessions/{id}/select-object   point-prompted SAM (tunnelbook.data.sam_point): click a
+                            point -> mark every boundary tracing that object's outline.
   /api/sessions/{id}/edge-configs   save/load named edge-mark sets in the session's dataset dir
                             (marks stored as original region-label pairs).
 
@@ -38,14 +44,20 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 from pydantic import BaseModel
+from skimage.segmentation import find_boundaries
 
 from tunnelbook.config import Config
 from tunnelbook.data.dataset import (
     find_dataset, indices_to_pairs, label_map_md5, list_edge_configs,
     load_dataset, load_edge_config, resolve_marks, save_dataset, save_edge_config,
 )
+from tunnelbook.data.edges import (
+    condition_label_map, detect_canny_raster, edge_canny_alignment, edge_gradient_strength,
+    edge_params_for, image_gradient_strength,
+)
 from tunnelbook.data.labelmap import build_instance, edge_depth_scores, region_boundary_segments
 from tunnelbook.data.realimage import compute_depth, segment_image
+from tunnelbook.data.sam_point import get_sam_predictor, predict_point_mask
 from tunnelbook.data.spam_segment import SAM_CHECKPOINT, segment_image_spam
 from tunnelbook.export import build_layer_ai_docs
 from tunnelbook.model import build_model
@@ -62,6 +74,13 @@ USE_SAM = os.environ.get("SPAM_SAM", "1") != "0"          # SPAM_SAM=0 -> faster
 # "slic" is the CPU-only skimage path (tunnelbook.data.realimage.segment_image) -- no CUDA, no SAM,
 # so a teammate can run the whole UI on a laptop. Set SEG_BACKEND=slic to use it.
 SEG_BACKEND = os.environ.get("SEG_BACKEND", "spam").lower()
+# Depth checkpoint: "large" (default, 335M params, best quality) or "small"/"base" for faster
+# CPU-only local testing (see tunnelbook.data.depthmodel.MODELS). Set DEPTH_MODEL=small.
+DEPTH_MODEL = os.environ.get("DEPTH_MODEL", "large").lower()
+# "select object" (point-prompted SAM): min fraction of a boundary's pixels that must lie on the
+# clicked object's outline to mark it. A fixed cutoff, not a percentile -- this is a direct "is
+# this boundary part of the traced object" decision, not a ranking over all boundaries.
+SELECT_OBJECT_ALIGN_THRESHOLD = 0.3
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spam_cache")
 RUNS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
 
@@ -96,6 +115,11 @@ class SolveRequest(BaseModel):
 class ScoresRequest(BaseModel):
     cut_score: str = "laplacian"
     cut_log_sigma: float = 2.0
+
+
+class SelectObjectRequest(BaseModel):
+    x: float
+    y: float
 
 
 class EdgeConfigSaveRequest(BaseModel):
@@ -207,11 +231,14 @@ def _layer_sheets(inst, sol, rgb: np.ndarray) -> List[np.ndarray]:
     return out
 
 
-def _edges_payload(inst, scores=None) -> List[dict]:
+def _edges_payload(inst, scores=None, canny_align=None) -> List[dict]:
     """One clickable item per region-adjacency boundary, aligned to inst.edges order.
 
     ``scores`` (aligned to ``inst.edges``) is the normalized depth-edge strength s_e in [0,1]
-    used for the frontend crease-map heatmap.
+    used for the frontend crease-map heatmap. ``canny_align`` (keyed by positional (i,j), from
+    ``edge_canny_alignment``) is how much of the boundary coincides with a detected Canny edge --
+    a depth-independent signal the frontend's "auto select edges" uses alongside the depth score,
+    since a visually sharp silhouette can sit on a depth-flat/noisy stretch of the estimate.
     """
     segs = region_boundary_segments(inst.label_map, inst.region_ids)
     out = []
@@ -219,7 +246,8 @@ def _edges_payload(inst, scores=None) -> List[dict]:
         i, j = int(i), int(j)
         s = segs.get((i, j))
         score = float(scores[e]) if scores is not None and e < len(scores) else 0.0
-        out.append({"index": e, "i": i, "j": j, "score": score,
+        align = float(canny_align.get((i, j), 0.0)) if canny_align is not None else 0.0
+        out.append({"index": e, "i": i, "j": j, "score": score, "cannyAlign": align,
                     "segments": [] if s is None else s.tolist()})
     return out
 
@@ -319,7 +347,10 @@ def health():
 
 
 @app.post("/api/sessions")
-async def create_session(image: UploadFile = File(...), n_layers: int = Form(5)):
+async def create_session(
+    image: UploadFile = File(...), n_layers: int = Form(5),
+    edge_condition: bool = Form(False), canny_low: int = Form(50), canny_high: int = Form(150),
+):
     try:
         rgb = _load_rgb(await image.read())
     except Exception:
@@ -338,7 +369,7 @@ async def create_session(image: UploadFile = File(...), n_layers: int = Form(5))
             d, heal = None, True
     if d is None:
         label_map = _segment(rgb)
-        depth = compute_depth(rgb, "model")  # Depth Anything V2 (the laplacian cut needs real depth)
+        depth = compute_depth(rgb, "model", model_name=DEPTH_MODEL)  # Depth Anything V2 (the laplacian cut needs real depth)
         seg_params = (
             {"backend": "slic", "max_dim": MAX_DIM} if SEG_BACKEND == "slic"
             else {"backend": SEG_BACKEND, "nspix": NSPIX, "points_per_side": POINTS_PER_SIDE,
@@ -347,9 +378,18 @@ async def create_session(image: UploadFile = File(...), n_layers: int = Form(5))
         d = save_dataset(rgb, label_map, depth,
                          source_name=image.filename or "image",
                          seg_params=seg_params,
-                         depth_params={"source": "model", "model_name": "large", "infer_size": None},
+                         depth_params={"source": "model", "model_name": DEPTH_MODEL, "infer_size": None},
                          force=heal)  # heal: overwrite the corrupt copy (edge configs survive)
         print(f"[dataset] saved {d.name}")
+
+    # Edge conditioning: re-split superpixels so their boundaries follow real Canny object edges
+    # instead of only the superpixel tessellation. Recomputed per session (not cached in the
+    # dataset) -- it's CPU-cheap and deterministic from (rgb, base label_map, canny thresholds).
+    if edge_condition:
+        label_map, n_conditioned = condition_label_map(
+            rgb, label_map, canny_low=canny_low, canny_high=canny_high)
+        print(f"[edge_condition] regions -> {n_conditioned}")
+
     cfg = Config(n_layers=n_layers, fix_x=False, lambda_support=1.0, verbose=False)
     inst = build_instance(label_map, depth, cfg)
 
@@ -363,9 +403,30 @@ async def create_session(image: UploadFile = File(...), n_layers: int = Form(5))
     }
     _sessions[session_id] = sess
 
+    # Warm up SAM's image embedding here (same step as segmentation/depth) rather than lazily on
+    # the first "select object" click, so that click is fast instead of paying the CPU
+    # image-encoder cost right when the user is trying to use the feature. Best-effort: if it
+    # fails (e.g. no network for the first-ever checkpoint download), leave sam_image_set unset
+    # so /select-object's own lazy set_image still runs as a fallback.
+    try:
+        get_sam_predictor().set_image(rgb)
+        sess["sam_image_set"] = True
+    except Exception as e:
+        print(f"[sam] warm-up failed, will retry lazily on first click: {e}")
+
     # depth-edge strength per boundary (LoG laplacian, normalized [0,1]) for the crease heatmap
     scores = edge_depth_scores(inst, depth_map=depth, method="laplacian", log_sigma=2.0)
-    edges = _edges_payload(inst, scores)
+    # Visual edge strength per boundary: independent of depth, so a visually sharp silhouette
+    # still reads as a real edge even where the depth estimate is too smooth/noisy to show a jump.
+    # Uses continuous gradient magnitude (image_gradient_strength), not the binary Canny raster --
+    # after edge-conditioning, most boundaries were literally created by wherever Canny fired, so
+    # a binary "coincides with that raster" check saturates near 1.0 for the majority of them and
+    # can't tell a strong real edge from a faint one that barely cleared Canny's threshold.
+    _ep = edge_params_for(rgb.shape)
+    gradient_map = image_gradient_strength(rgb, blur_ksize=int(_ep["blur_ksize"]),
+                                           blur_sigma=_ep["blur_sigma"])
+    canny_align = edge_gradient_strength(inst.label_map, inst.region_ids, gradient_map)
+    edges = _edges_payload(inst, scores, canny_align)
     # initial view = depth-binned layers, no solve -> instant upload; user solves on demand
     lhat1 = inst.lhat + 1
     baseline = _data_url(_png_bytes(_overlay_img(inst, lhat1, rgb)))
@@ -428,6 +489,34 @@ async def recompute_scores(session_id: str, req: ScoresRequest):
     scores = edge_depth_scores(sess["inst"], depth_map=sess["depth"],
                                method=req.cut_score, log_sigma=req.cut_log_sigma)
     return {"scores": [float(s) for s in scores]}
+
+
+@app.post("/api/sessions/{session_id}/select-object")
+async def select_object(session_id: str, req: SelectObjectRequest):
+    """Point-prompted SAM: click a point -> mark every boundary tracing that object's outline.
+
+    The predictor's image embedding is set once per session (the slow CPU encoder pass) and
+    reused for every subsequent click, whether on this object or another one in the same photo.
+    """
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown session")
+
+    predictor = get_sam_predictor()
+    if not sess.get("sam_image_set"):
+        predictor.set_image(sess["rgb"])
+        sess["sam_image_set"] = True
+
+    mask, score = predict_point_mask(predictor, req.x, req.y)
+    outline = find_boundaries(mask, mode="outer")
+    inst = sess["inst"]
+    align = edge_canny_alignment(inst.label_map, inst.region_ids, outline, dilate=2)
+
+    edge_indices = [
+        e for e, (i, j) in enumerate(inst.edges)
+        if align.get((int(i), int(j)), 0.0) >= SELECT_OBJECT_ALIGN_THRESHOLD
+    ]
+    return {"edgeIndices": edge_indices, "score": score}
 
 
 @app.get("/api/sessions/{session_id}/edge-configs")
