@@ -110,6 +110,13 @@ class SolveRequest(BaseModel):
     mip_focus: int = 1                # cut objective: Gurobi MIPFocus (1 = feasibility focus)
     cut_score: str = "laplacian"      # cut objective: "laplacian" | "meandiff"
     cut_log_sigma: float = 2.0        # cut objective: LoG spatial scale (px) for the crease score
+    lambda_coherence: float = 0.0     # cut objective: depth-plateau coherence tie-breaker (0 = off).
+                                      # ON (0.05) fixes free plateau splits (robert-keane N=5:
+                                      # mountain+sky unified, z spread, penalty paid ~0), but on
+                                      # hard mark-heavy N=7 solves the extra rows degraded the
+                                      # 180s incumbent (redcharlie: z collapse, rho -0.57 vs 0.05)
+                                      # -- hence default OFF; enable via the UI toggle per solve
+    coherence_eps: float = 0.02       # plateau depth-gap threshold for the coherence pairs
 
 
 class ScoresRequest(BaseModel):
@@ -186,6 +193,12 @@ def _png_bytes(rgb_uint8: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
+def _png_bytes_rgba(rgba_uint8: np.ndarray) -> bytes:
+    """PNG-encode an (H, W, 4) RGBA array, preserving the alpha channel (cv2 wants BGRA)."""
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(rgba_uint8, cv2.COLOR_RGBA2BGRA))
+    return buf.tobytes()
+
+
 def _data_url(png: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
 
@@ -231,6 +244,57 @@ def _layer_sheets(inst, sol, rgb: np.ndarray) -> List[np.ndarray]:
     return out
 
 
+def _layer_masks(inst, sol, rgb: np.ndarray, max_dim: int = 512):
+    """Per-layer RGBA textures for the 3D book-stack preview, TWO styles per layer.
+
+    Material on each plane is the *retained* sheet (``sol.x`` visible + ``sol.support``), so the
+    stack shows the physical pages, not just the visible silhouettes:
+      photo -- the photo where visible; support material as a paper-toned wash of the photo
+               (readable as "backing", still hints at what sits in front of it);
+      sheet -- the fabrication look mirroring the .ai export: paper stock, dark Canny engrave
+               (30/100, the export's parity edges) on visible regions only, red cut lines along
+               every material boundary, and the outer frame band with its cut rectangle.
+    Both styles share one canvas padded by the frame band so toggling never shifts geometry.
+    Front layer = layer_01 (index 0).  Downscaled to ``max_dim`` (INTER_AREA antialiases the
+    silhouette edges) so the N*2 masks don't bloat the solve response.
+    Returns ``(photo_masks, sheet_masks)``."""
+    H, W = rgb.shape[:2]
+    band = max(8, round(0.04 * max(H, W)))          # preview frame margin (export: border_in)
+    paper = np.array([243, 240, 232], dtype=np.uint8)
+    wash = np.array([203, 198, 188], dtype=np.float32)
+    ink, red = (64, 60, 54), (198, 40, 40)
+    engrave = cv2.dilate(cv2.Canny(rgb, 30, 100), np.ones((2, 2), np.uint8)) > 0
+    s = max_dim / (max(H, W) + 2 * band)
+    photo_out, sheet_out = [], []
+    for l in range(inst.n_layers):
+        vis = inst.paint(sol.x[:, l].astype(float), fill=0.0) > 0.5
+        sup = inst.paint(sol.support[:, l].astype(float), fill=0.0) > 0.5
+        mat = vis | sup
+        ph = np.zeros((H, W, 4), dtype=np.uint8)
+        ph[..., :3][vis] = rgb[vis]
+        ph[..., :3][sup] = (0.35 * rgb[sup] + 0.65 * wash).astype(np.uint8)
+        ph[..., 3] = np.where(mat, 255, 0).astype(np.uint8)
+        sh = np.zeros((H, W, 4), dtype=np.uint8)
+        sh[..., :3][mat] = paper
+        sh[..., :3][vis & engrave] = ink
+        cut = cv2.morphologyEx(mat.astype(np.uint8), cv2.MORPH_GRADIENT,
+                               np.ones((3, 3), np.uint8)) > 0
+        sh[..., :3][cut] = red
+        sh[..., 3] = np.where(mat | cut, 255, 0).astype(np.uint8)
+        ph = cv2.copyMakeBorder(ph, band, band, band, band,
+                                cv2.BORDER_CONSTANT, value=(0, 0, 0, 0))
+        sh = cv2.copyMakeBorder(sh, band, band, band, band, cv2.BORDER_CONSTANT,
+                                value=(int(paper[0]), int(paper[1]), int(paper[2]), 255))
+        cv2.rectangle(sh, (1, 1), (sh.shape[1] - 2, sh.shape[0] - 2), (*red, 255), 2)
+        if s < 1:
+            dst = (max(1, round(sh.shape[1] * s)), max(1, round(sh.shape[0] * s)))
+            ph = cv2.resize(ph, dst, interpolation=cv2.INTER_AREA)
+            sh = cv2.resize(sh, dst, interpolation=cv2.INTER_AREA)
+        photo_out.append(ph)
+        sheet_out.append(sh)
+    return photo_out, sheet_out
+
+
 def _edges_payload(inst, scores=None, canny_align=None) -> List[dict]:
     """One clickable item per region-adjacency boundary, aligned to inst.edges order.
 
@@ -274,6 +338,8 @@ def _build_cfg(req: "SolveRequest") -> Config:
                       connectivity_method=req.connectivity_method,
                       y_monotone=req.y_monotone,
                       norel_time=req.norel_time, mip_focus=req.mip_focus,
+                      lambda_coherence=req.lambda_coherence,
+                      coherence_eps=req.coherence_eps,
                       lambda_split=0.0, mip_gap=0.02,
                       time_limit=req.time_limit, verbose=False,
                       log_progress=True)  # stream incumbents (+ z medians) to the console
@@ -327,7 +393,18 @@ def _save_run(session_id: str, req: "SolveRequest", inst, sol,
         "objective_mode": req.objective, "min_layer_regions": req.min_layer_regions,
         "min_layer_area": req.min_layer_area,
         "lambda_cut": req.lambda_cut, "cut_score": req.cut_score,
+        # full solver config, so a run dir is never ambiguous about what actually ran
+        "lambda_depth": req.lambda_depth, "cut_log_sigma": req.cut_log_sigma,
+        "time_limit": req.time_limit,
+        "connectivity": req.connectivity, "connectivity_method": req.connectivity_method,
+        "y_monotone": req.y_monotone,
+        "norel_time": req.norel_time, "mip_focus": req.mip_focus,
+        "lambda_coherence": req.lambda_coherence, "coherence_eps": req.coherence_eps,
         "status": sol.status, "runtime": sol.runtime, "objective": sol.obj_breakdown,
+        # gurobi diagnostics: gap/bound/nodes (+ lazy cut count and k-median z when present)
+        "solver": sol.extra.get("solver"),
+        "lazy_cuts": sol.extra.get("lazy_cuts"),
+        "z": sol.extra.get("z"),
         "markings": marks, "layer_of": [int(v) for v in sol.layer_of],
     }
     with open(os.path.join(d, "run.json"), "w") as f:
@@ -470,9 +547,14 @@ async def solve_session(session_id: str, req: SolveRequest):
 
     print(f"[solve] {len(req.markings)} marks | N={req.n_layers} | {sol.status} "
           f"obj={sol.obj_total:.3f} in {sol.runtime:.1f}s -> runs/{os.path.basename(run_dir)}")
+    photo_masks, sheet_masks = _layer_masks(inst, sol, sess["rgb"])
     return {
         "overlay": _data_url(_png_bytes(overlay_img)),
         "layers": [_data_url(_png_bytes(im)) for im in layer_imgs],
+        # per-layer material textures for the 3D stacked book preview (front = layer_01):
+        # photo texture + .ai-style fabrication sheet, both incl. support material
+        "masks": [_data_url(_png_bytes_rgba(m)) for m in photo_masks],
+        "sheetMasks": [_data_url(_png_bytes_rgba(m)) for m in sheet_masks],
         "nLayers": req.n_layers, "objective": sol.obj_breakdown,
         "status": sol.status, "runtime": sol.runtime,
         "z": sol.extra.get("z"), "layerOf": [int(v) for v in sol.layer_of],

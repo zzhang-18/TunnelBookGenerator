@@ -1536,6 +1536,10 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* wrap instead of clipping against the card's overflow:hidden when the
+     solver-option row outgrows the card width */
+  flex-wrap: wrap;
+  row-gap: 6px;
   padding: 8px 14px;
   background: rgba(0, 0, 0, 0.25);
   border-bottom: 1px solid var(--border-dim);
@@ -2062,6 +2066,11 @@ body {
   font-size: 11px;
   color: var(--text-lo);
   line-height: 1.5;
+}
+
+.viz-book-wrap {
+  display: flex;
+  flex-direction: column;
 }
 
 .viz-scene {

@@ -42,6 +42,7 @@ type Screen = "home" | "edges" | "output";
 // real boundary far below it. A percentile-of-that-image cutoff self-calibrates instead.
 const AUTO_SELECT_TOP_FRACTION = 0.2;
 type MarkType = "split_soft" | "split_hard" | "delete";
+type ConnMethod = "flow" | "lazy";
 type EdgeItem = {
   index: number; i: number; j: number; segments: number[][]; score?: number; cannyAlign?: number;
 };
@@ -66,6 +67,9 @@ type SessionData = {
 };
 type SolveResult = {
   overlay: string;
+  layers?: string[];        // per-layer semantic PNGs (front = layer_01)
+  masks?: string[];         // per-layer material textures (photo style) for the 3D stack
+  sheetMasks?: string[];    // same planes, .ai-export fabrication look (paper/engrave/cut)
   nLayers: number;
   status: string;
   runtime: number;
@@ -234,6 +238,10 @@ async function solveSession(
   lambdaDepth: number,
   connectivity: boolean,
   yMonotone: boolean,
+  connectivityMethod: ConnMethod,
+  norelTime: number,
+  mipFocus: number,
+  lambdaCoherence: number,
 ): Promise<SolveResult> {
   const res = await fetch(apiUrl(`/api/sessions/${sessionId}/solve`), {
     method: "POST",
@@ -242,6 +250,8 @@ async function solveSession(
       markings, n_layers: nLayers, lambda_split: lambdaSplit, objective,
       cut_log_sigma: cutLogSigma, lambda_depth: lambdaDepth,
       connectivity, y_monotone: yMonotone,
+      connectivity_method: connectivityMethod, norel_time: norelTime, mip_focus: mipFocus,
+      lambda_coherence: lambdaCoherence,
     }),
   });
   if (!res.ok)
@@ -341,6 +351,10 @@ async function exportLayers(
   lambdaDepth: number,
   connectivity: boolean,
   yMonotone: boolean,
+  connectivityMethod: ConnMethod,
+  norelTime: number,
+  mipFocus: number,
+  lambdaCoherence: number,
   mode: ExportMode,
   contentWidthIn: number,
   borderIn: number,
@@ -351,6 +365,8 @@ async function exportLayers(
     body: JSON.stringify({
       markings, n_layers: nLayers, objective, lambda_depth: lambdaDepth,
       connectivity, y_monotone: yMonotone,
+      connectivity_method: connectivityMethod, norel_time: norelTime, mip_focus: mipFocus,
+      lambda_coherence: lambdaCoherence,
       mode, content_width_in: contentWidthIn, border_in: borderIn,
     }),
   });
@@ -747,6 +763,167 @@ function HomeScreen({
   );
 }
 
+// ─── Book Visualizer ──────────────────────────────────────────────────────────
+// Interactive CSS-3D preview of the solved layer stack (reintroduced from 0e47c58): each
+// layer is a translateZ-offset plane, fed the solver's per-layer transparent silhouettes
+// (SolveResult.masks) so the sheets show through in depth like a real tunnel book.
+
+function BookVisualizer({ masks, sheetMasks }: { masks: string[]; sheetMasks?: string[] }) {
+  const [rotX, setRotX] = useState(16);
+  const [rotY, setRotY] = useState(-26);
+  const [scale, setScale] = useState(1);
+  const [dragging, setDragging] = useState(false);
+  const [hidden, setHidden] = useState<Set<number>>(new Set());
+  // texture source: photo pixels vs the .ai-style fabrication sheet (paper/engrave/cut)
+  const [tex, setTex] = useState<"photo" | "sheet">("photo");
+  const hasSheet = !!sheetMasks && sheetMasks.length === masks.length;
+  const planes = tex === "sheet" && hasSheet ? sheetMasks! : masks;
+  const drag = useRef<{ x: number; y: number; rx: number; ry: number } | null>(null);
+  const sceneRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!dragging) return;
+    const move = (e: globalThis.MouseEvent) => {
+      if (!drag.current) return;
+      setRotY(drag.current.ry + (e.clientX - drag.current.x) * 0.5);
+      setRotX(drag.current.rx - (e.clientY - drag.current.y) * 0.3);
+    };
+    const up = () => setDragging(false);
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+  }, [dragging]);
+
+  useEffect(() => {
+    const el = sceneRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      setScale((s) => Math.min(3, Math.max(0.35, s - e.deltaY * 0.0012)));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  const onDown = (e: ReactMouseEvent) => {
+    drag.current = { x: e.clientX, y: e.clientY, rx: rotX, ry: rotY };
+    setDragging(true);
+    e.preventDefault();
+  };
+  const toggle = (i: number) =>
+    setHidden((prev) => {
+      const s = new Set(prev);
+      s.has(i) ? s.delete(i) : s.add(i);
+      return s;
+    });
+
+  const N = masks.length;
+  const GAP = 28; // px of depth between adjacent sheets
+  return (
+    <div className="viz-book-wrap">
+      <div
+        ref={sceneRef}
+        className="viz-scene"
+        onMouseDown={onDown}
+        style={{ cursor: dragging ? "grabbing" : "grab" }}
+      >
+        <div
+          className="viz-book"
+          style={{
+            transform: `translateZ(-${(N * GAP) / 2}px) scale(${scale}) rotateX(${rotX}deg) rotateY(${rotY}deg)`,
+          }}
+        >
+          {planes.map((src, i) =>
+            hidden.has(i) ? null : (
+              <img
+                key={`${tex}-${i}`}
+                src={src}
+                alt={`layer ${i + 1}`}
+                draggable={false}
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  width: "100%",
+                  height: "100%",
+                  objectFit: "contain",
+                  pointerEvents: "none",
+                  transform: `translateZ(${(N - 1 - i) * GAP}px)`,
+                  zIndex: N - i,
+                  filter: "drop-shadow(0 3px 10px rgba(0,0,0,0.5))",
+                }}
+              />
+            ),
+          )}
+        </div>
+        <div className="viz-scene-hint">scroll to zoom · drag to rotate</div>
+      </div>
+
+      <div className="viz-rotate-row">
+        <button className="viz-ctrl-btn" onClick={() => setRotY((r) => r - 30)} title="Rotate left">
+          <I.ChevronLeft />
+        </button>
+        <div className="viz-zoom-controls">
+          <button className="viz-ctrl-btn" onClick={() => setScale((s) => Math.max(0.35, s - 0.15))} title="Zoom out">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="5" y1="12" x2="19" y2="12" /></svg>
+          </button>
+          <span className="viz-ctrl-label">{Math.round(scale * 100)}%</span>
+          <button className="viz-ctrl-btn" onClick={() => setScale((s) => Math.min(3, s + 0.15))} title="Zoom in">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+          </button>
+        </div>
+        <button className="viz-ctrl-btn" onClick={() => { setRotX(16); setRotY(-26); setScale(1); }} title="Reset view">
+          <I.RotateCcw />
+        </button>
+        {hasSheet && (
+          <div className="viz-zoom-controls" title="Plane texture: photo pixels vs the .ai fabrication sheet (paper + engrave + red cut lines); both include the support material">
+            {(["photo", "sheet"] as const).map((t) => (
+              <button
+                key={t}
+                className="viz-ctrl-btn"
+                onClick={() => setTex(t)}
+                style={{
+                  width: "auto", padding: "0 8px", fontSize: 9,
+                  fontFamily: "var(--font-mono)",
+                  color: tex === t ? "#22d3ee" : undefined,
+                  fontWeight: tex === t ? 700 : 400,
+                }}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+        )}
+        <span className="viz-ctrl-label-layers">{N - hidden.size}/{N} layers</span>
+        <button className="viz-ctrl-btn" onClick={() => setRotY((r) => r + 30)} title="Rotate right">
+          <I.ChevronRight />
+        </button>
+      </div>
+
+      <div className="viz-layer-list">
+        {masks.map((_, i) => {
+          const on = !hidden.has(i);
+          return (
+            <button
+              key={i}
+              className={`viz-layer-row-header ${on ? "" : "viz-layer-row-header--locked"}`}
+              onClick={() => toggle(i)}
+              title={on ? "Hide layer" : "Show layer"}
+              style={{ opacity: on ? 1 : 0.5 }}
+            >
+              <div className="viz-layer-swatch" style={{ background: heatColor(N > 1 ? i / (N - 1) : 0) }} />
+              <span className="viz-layer-name">layer_{String(i + 1).padStart(2, "0")}</span>
+              <I.Eye />
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ─── Edge Selection Screen ────────────────────────────────────────────────────
 
 function EdgeSelectionScreen({
@@ -778,6 +955,10 @@ function EdgeSelectionScreen({
     lambdaDepth: number,
     connectivity: boolean,
     yMonotone: boolean,
+    connectivityMethod: ConnMethod,
+    norelTime: number,
+    mipFocus: number,
+    lambdaCoherence: number,
   ) => void;
   onBack: () => void;
 }) {
@@ -787,10 +968,18 @@ function EdgeSelectionScreen({
   const [lambdaDepth, setLambdaDepth] = useState(0);
   const [connectivity, setConnectivity] = useState(true);
   const [yMonotone, setYMonotone] = useState(false);
+  // solver knobs — defaults mirror the server's SolveRequest (norel_time=60, mip_focus=1, flow)
+  const [lazyConn, setLazyConn] = useState(false);
+  const [norelOn, setNorelOn] = useState(true);
+  const [mipFocusOn, setMipFocusOn] = useState(true);
+  // depth-plateau coherence tie-breaker — default OFF (mirrors SolveRequest); 0.05 is the
+  // validated weight when toggled on
+  const [cohOn, setCohOn] = useState(false);
+  const [lambdaCoh, setLambdaCoh] = useState(0.05);
   const [logSigma, setLogSigma] = useState(2.0);
   // per-pixel positional region index decoded from regionMap (idx+1 in R + G<<8; 0 = none)
   const regionIdxRef = useRef<{ data: Uint8ClampedArray; w: number; h: number } | null>(null);
-  const [hoverRegion, setHoverRegion] = useState<{ idx: number; px: number; py: number } | null>(null);
+  const [hoverRegion, setHoverRegion] = useState<{ idx: number; px: number; py: number; w: number; h: number } | null>(null);
   const [scoreOverride, setScoreOverride] = useState<number[] | null>(null);
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   const [overlay, setOverlay] = useState<string | null>(baselineOverlay);
@@ -948,7 +1137,10 @@ function EdgeSelectionScreen({
       setHoverRegion(null);
       return;
     }
-    setHoverRegion({ idx, px: ev.clientX - rect.left, py: ev.clientY - rect.top });
+    setHoverRegion({
+      idx, px: ev.clientX - rect.left, py: ev.clientY - rect.top,
+      w: rect.width, h: rect.height,
+    });
   };
 
   const strokeFor = (i: number, m: MarkType | undefined) => {
@@ -957,11 +1149,17 @@ function EdgeSelectionScreen({
     return colorOf(m);
   };
 
+  // wire values for the solver-knob checkboxes (server treats 0 as "off")
+  const connMethod: ConnMethod = lazyConn ? "lazy" : "flow";
+  const norelTime = norelOn ? 60 : 0;
+  const mipFocus = mipFocusOn ? 1 : 0;
+  const lambdaCoherence = cohOn ? lambdaCoh : 0;
+
   const handleSolve = async () => {
     setIsSolving(true);
     setSolveError(null);
     try {
-      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma, lambdaDepth, connectivity, yMonotone);
+      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence);
       setOverlay(r.overlay);
       setResult(r);
     } catch (err: any) {
@@ -1118,6 +1316,62 @@ function EdgeSelectionScreen({
               />
               full backing
             </label>
+            <label
+              title="Lazy cut-set connectivity: no flow variables; frame-connectivity cuts are added only when a candidate violates them. Same optimum as flow, usually better incumbents on N>=4 cut solves. Needs fabrication ON"
+              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11,
+                       color: "var(--text-dim)", opacity: connectivity ? 1 : 0.4 }}
+            >
+              <input
+                type="checkbox" checked={lazyConn} disabled={!connectivity}
+                onChange={(ev) => setLazyConn(ev.target.checked)}
+              />
+              lazy conn
+            </label>
+            <label
+              title="Gurobi NoRelHeurTime=60: spend the first 60s in the no-relaxation heuristic. Rescues incumbents on N>=4 cut solves where the LP bound is useless (cut objective only)"
+              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)" }}
+            >
+              <input
+                type="checkbox" checked={norelOn}
+                onChange={(ev) => setNorelOn(ev.target.checked)}
+              />
+              norel 60s
+            </label>
+            <label
+              title="Gurobi MIPFocus=1: bias the search toward finding feasible solutions over proving bounds (cut objective only)"
+              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)" }}
+            >
+              <input
+                type="checkbox" checked={mipFocusOn}
+                onChange={(ev) => setMipFocusOn(ev.target.checked)}
+              />
+              mip focus
+            </label>
+            {objective === "cut" && (
+              <label
+                title="Depth-plateau coherence: regions the depth map can't tell apart (gap < 0.02) resist being split across sheets. Fixes arbitrary sky seams / bisected far objects (validated N<=5); on hard 7-layer solves with many marks it can degrade the 180s incumbent — toggle off if layering worsens"
+                style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)" }}
+              >
+                <input
+                  type="checkbox" checked={cohOn}
+                  onChange={(ev) => setCohOn(ev.target.checked)}
+                />
+                coherence
+              </label>
+            )}
+            {objective === "cut" && cohOn && (
+              <label
+                title="Coherence weight: tie-breaker scale (0.05 default). If it visibly fights the layering, it's too high"
+                style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)" }}
+              >
+                coh λ {lambdaCoh.toFixed(2)}
+                <input
+                  type="range" min={0.01} max={0.2} step={0.01} value={lambdaCoh}
+                  onChange={(ev) => setLambdaCoh(Number(ev.target.value))}
+                  style={{ width: 80 }}
+                />
+              </label>
+            )}
             <button
               className="ctrl-btn ctrl-btn--ghost"
               onClick={() => setMarks({})}
@@ -1199,7 +1453,15 @@ function EdgeSelectionScreen({
           )}
           {hoverRegion && regionDepth[hoverRegion.idx] !== undefined && (
             <div style={{
-              position: "absolute", left: hoverRegion.px + 14, top: hoverRegion.py + 14,
+              position: "absolute",
+              // anchor on whichever side of the cursor has more room, so the tooltip
+              // stays inside the (overflow:hidden) canvas card near the edges
+              ...(hoverRegion.px > hoverRegion.w / 2
+                ? { right: hoverRegion.w - hoverRegion.px + 14 }
+                : { left: hoverRegion.px + 14 }),
+              ...(hoverRegion.py > hoverRegion.h / 2
+                ? { bottom: hoverRegion.h - hoverRegion.py + 14 }
+                : { top: hoverRegion.py + 14 }),
               pointerEvents: "none", zIndex: 5, background: "rgba(10,10,18,0.92)",
               border: "1px solid rgba(255,255,255,0.18)", borderRadius: 6,
               padding: "6px 8px", fontSize: 11, fontFamily: "monospace",
@@ -1257,6 +1519,19 @@ function EdgeSelectionScreen({
           </svg>
         </div>
       </div>
+
+      {/* 3D book preview: solver's per-layer silhouettes stacked in depth (drag to rotate) */}
+      {result?.masks && result.masks.length > 0 && (
+        <div className="canvas-card">
+          <div className="canvas-tools">
+            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>
+              <I.BookOpen /> book preview — solved layer stack · drag to rotate, scroll to zoom
+            </span>
+            <span className="viz-ctrl-label-layers">{result.masks.length} layers · {result.status}</span>
+          </div>
+          <BookVisualizer masks={result.masks} sheetMasks={result.sheetMasks} />
+        </div>
+      )}
 
       {/* crease map: live heatmap of per-boundary depth-edge strength (the cut score) */}
       <div className="canvas-card">
@@ -1358,7 +1633,7 @@ function EdgeSelectionScreen({
           {solveError && <span className="seg-error-inline">// {solveError}</span>}
           <button
             className="ctrl-btn ctrl-btn--ghost"
-            onClick={() => onSubmit(markingsArray(), objective, markCount, lambdaDepth, connectivity, yMonotone)}
+            onClick={() => onSubmit(markingsArray(), objective, markCount, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence)}
           >
             export →
           </button>
@@ -1387,6 +1662,10 @@ function OutputScreen({
   lambdaDepth,
   connectivity,
   yMonotone,
+  connectivityMethod,
+  norelTime,
+  mipFocus,
+  lambdaCoherence,
   exportMode,
   frameWidthIn,
   frameBorderIn,
@@ -1401,6 +1680,10 @@ function OutputScreen({
   lambdaDepth: number;
   connectivity: boolean;
   yMonotone: boolean;
+  connectivityMethod: ConnMethod;
+  norelTime: number;
+  mipFocus: number;
+  lambdaCoherence: number;
   exportMode: ExportMode;
   frameWidthIn: number;
   frameBorderIn: number;
@@ -1449,7 +1732,8 @@ function OutputScreen({
         `TunnelBook_${safeBase}_layers_${stamp}.zip`,
         await exportLayers(
           sessionId, markings, numLayers, objective, lambdaDepth,
-          connectivity, yMonotone,
+          connectivity, yMonotone, connectivityMethod, norelTime, mipFocus,
+          lambdaCoherence,
           exportMode, frameWidthIn, frameBorderIn,
         ),
       );
@@ -1551,6 +1835,10 @@ function App() {
   const [lambdaDepth, setLambdaDepth] = useState(0);
   const [connectivity, setConnectivity] = useState(true);
   const [yMonotone, setYMonotone] = useState(false);
+  const [connectivityMethod, setConnectivityMethod] = useState<ConnMethod>("flow");
+  const [norelTime, setNorelTime] = useState(60);
+  const [mipFocus, setMipFocus] = useState(1);
+  const [lambdaCoherence, setLambdaCoherence] = useState(0);
   const [regionMap, setRegionMap] = useState<string | null>(null);
   const [regionDepth, setRegionDepth] = useState<number[]>([]);
 
@@ -1614,12 +1902,20 @@ function App() {
     lambdaD: number,
     conn: boolean,
     yMono: boolean,
+    connMethod: ConnMethod,
+    norel: number,
+    focus: number,
+    lambdaCoh: number,
   ) => {
     setMarkings(marks);
     setObjective(obj);
     setLambdaDepth(lambdaD);
     setConnectivity(conn);
     setYMonotone(yMono);
+    setConnectivityMethod(connMethod);
+    setLambdaCoherence(lambdaCoh);
+    setNorelTime(norel);
+    setMipFocus(focus);
     setSelectedEdgeCount(markCount);
     setScreen("output");
   };
@@ -1670,6 +1966,10 @@ function App() {
               lambdaDepth={lambdaDepth}
               connectivity={connectivity}
               yMonotone={yMonotone}
+              connectivityMethod={connectivityMethod}
+              norelTime={norelTime}
+              mipFocus={mipFocus}
+              lambdaCoherence={lambdaCoherence}
               exportMode={exportMode}
               frameWidthIn={frameWidthIn}
               frameBorderIn={frameBorderIn}
