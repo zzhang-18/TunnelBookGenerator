@@ -43,6 +43,7 @@ type Screen = "home" | "edges" | "output";
 const AUTO_SELECT_TOP_FRACTION = 0.2;
 type MarkType = "split_soft" | "split_hard" | "delete";
 type ConnMethod = "flow" | "lazy";
+type CutScore = "laplacian" | "meandiff";
 type EdgeItem = {
   index: number; i: number; j: number; segments: number[][]; score?: number; cannyAlign?: number;
 };
@@ -243,6 +244,7 @@ async function solveSession(
   mipFocus: number,
   lambdaCoherence: number,
   minLayerArea: number,
+  cutScore: CutScore,
 ): Promise<SolveResult> {
   const res = await fetch(apiUrl(`/api/sessions/${sessionId}/solve`), {
     method: "POST",
@@ -253,6 +255,7 @@ async function solveSession(
       connectivity, y_monotone: yMonotone,
       connectivity_method: connectivityMethod, norel_time: norelTime, mip_focus: mipFocus,
       lambda_coherence: lambdaCoherence, min_layer_area: minLayerArea,
+      cut_score: cutScore,
     }),
   });
   if (!res.ok)
@@ -265,11 +268,12 @@ async function solveSession(
 async function fetchScores(
   sessionId: string,
   cutLogSigma: number,
+  cutScore: CutScore,
 ): Promise<number[]> {
   const res = await fetch(apiUrl(`/api/sessions/${sessionId}/scores`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cut_log_sigma: cutLogSigma, cut_score: "laplacian" }),
+    body: JSON.stringify({ cut_log_sigma: cutLogSigma, cut_score: cutScore }),
   });
   if (!res.ok) throw new Error(`scores failed (${res.status})`);
   return (await res.json()).scores as number[];
@@ -357,6 +361,7 @@ async function exportLayers(
   mipFocus: number,
   lambdaCoherence: number,
   minLayerArea: number,
+  cutScore: CutScore,
   mode: ExportMode,
   contentWidthIn: number,
   borderIn: number,
@@ -369,6 +374,7 @@ async function exportLayers(
       connectivity, y_monotone: yMonotone,
       connectivity_method: connectivityMethod, norel_time: norelTime, mip_focus: mipFocus,
       lambda_coherence: lambdaCoherence, min_layer_area: minLayerArea,
+      cut_score: cutScore,
       mode, content_width_in: contentWidthIn, border_in: borderIn,
     }),
   });
@@ -952,6 +958,7 @@ function EdgeSelectionScreen({
     mipFocus: number,
     lambdaCoherence: number,
     minLayerArea: number,
+    cutScore: CutScore,
   ) => void;
   onBack: () => void;
 }) {
@@ -971,6 +978,8 @@ function EdgeSelectionScreen({
   const [lambdaCoh, setLambdaCoh] = useState(0.05);
   // per-layer visible-area floor — mirrors SolveRequest.min_layer_area (cut objective)
   const [minLayerArea, setMinLayerArea] = useState(0.10);
+  // crease/cut score: laplacian (LoG across the boundary) vs meandiff (region-mean depth gap)
+  const [cutScore, setCutScore] = useState<CutScore>("laplacian");
   const [logSigma, setLogSigma] = useState(2.0);
   // per-pixel positional region index decoded from regionMap (idx+1 in R + G<<8; 0 = none)
   const regionIdxRef = useRef<{ data: Uint8ClampedArray; w: number; h: number } | null>(null);
@@ -1093,12 +1102,12 @@ function EdgeSelectionScreen({
       return; // initial render uses the baseline scores already in `edges`
     }
     const t = setTimeout(() => {
-      fetchScores(sessionId, logSigma)
+      fetchScores(sessionId, logSigma, cutScore)
         .then(setScoreOverride)
         .catch(() => {});
     }, 150);
     return () => clearTimeout(t);
-  }, [logSigma, sessionId]);
+  }, [logSigma, cutScore, sessionId]);
 
   // decode the region-index map once per session for hover hit-testing
   useEffect(() => {
@@ -1154,7 +1163,7 @@ function EdgeSelectionScreen({
     setIsSolving(true);
     setSolveError(null);
     try {
-      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea);
+      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea, cutScore);
       setOverlay(r.overlay);
       setResult(r);
     } catch (err: any) {
@@ -1260,7 +1269,7 @@ function EdgeSelectionScreen({
             <span className="canvas-tools-hint" style={{ marginRight: 4 }}>objective:</span>
             {([
               { key: "depth", label: "depth fit" },
-              { key: "cut", label: "cut · laplacian" },
+              { key: "cut", label: "cut" },
             ] as const).map((o) => (
               <button
                 key={o.key}
@@ -1278,6 +1287,31 @@ function EdgeSelectionScreen({
                 {o.label}
               </button>
             ))}
+            {objective === "cut" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: 8 }}>
+                <span className="canvas-tools-hint" style={{ marginRight: 2 }}>score:</span>
+                {([
+                  { key: "laplacian", label: "laplacian" },
+                  { key: "meandiff", label: "meandiff" },
+                ] as const).map((s) => (
+                  <button
+                    key={s.key}
+                    className="ctrl-btn"
+                    onClick={() => setCutScore(s.key)}
+                    title={s.key === "laplacian"
+                      ? "Cut cost from the Laplacian-of-Gaussian sampled across each boundary (crisp depth edges; uses the LoG σ slider below)"
+                      : "Cut cost from the region-mean depth gap |d_i − d_j| (simpler, σ-independent; cheaper to cut where mean depths differ)"}
+                    style={{
+                      borderColor: cutScore === s.key ? "var(--ink)" : "transparent",
+                      color: cutScore === s.key ? "var(--ink)" : "var(--text-dim)",
+                      fontWeight: cutScore === s.key ? 700 : 400,
+                    }}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            )}
             {objective === "cut" && (
               <label
                 title="k-median depth anchor: 0 = pure cut (your marks drive everything); above ~0.5 depth dominates and marks stop mattering"
@@ -1642,7 +1676,7 @@ function EdgeSelectionScreen({
           {solveError && <span className="seg-error-inline">// {solveError}</span>}
           <button
             className="ctrl-btn ctrl-btn--ghost"
-            onClick={() => onSubmit(markingsArray(), objective, markCount, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea)}
+            onClick={() => onSubmit(markingsArray(), objective, markCount, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea, cutScore)}
           >
             export →
           </button>
@@ -1676,6 +1710,7 @@ function OutputScreen({
   mipFocus,
   lambdaCoherence,
   minLayerArea,
+  cutScore,
   exportMode,
   frameWidthIn,
   frameBorderIn,
@@ -1695,6 +1730,7 @@ function OutputScreen({
   mipFocus: number;
   lambdaCoherence: number;
   minLayerArea: number;
+  cutScore: CutScore;
   exportMode: ExportMode;
   frameWidthIn: number;
   frameBorderIn: number;
@@ -1744,7 +1780,7 @@ function OutputScreen({
         await exportLayers(
           sessionId, markings, numLayers, objective, lambdaDepth,
           connectivity, yMonotone, connectivityMethod, norelTime, mipFocus,
-          lambdaCoherence, minLayerArea,
+          lambdaCoherence, minLayerArea, cutScore,
           exportMode, frameWidthIn, frameBorderIn,
         ),
       );
@@ -1851,6 +1887,7 @@ function App() {
   const [mipFocus, setMipFocus] = useState(1);
   const [lambdaCoherence, setLambdaCoherence] = useState(0);
   const [minLayerArea, setMinLayerArea] = useState(0.10);
+  const [cutScore, setCutScore] = useState<CutScore>("laplacian");
   const [regionMap, setRegionMap] = useState<string | null>(null);
   const [regionDepth, setRegionDepth] = useState<number[]>([]);
 
@@ -1919,6 +1956,7 @@ function App() {
     focus: number,
     lambdaCoh: number,
     minArea: number,
+    cScore: CutScore,
   ) => {
     setMarkings(marks);
     setObjective(obj);
@@ -1928,6 +1966,7 @@ function App() {
     setConnectivityMethod(connMethod);
     setLambdaCoherence(lambdaCoh);
     setMinLayerArea(minArea);
+    setCutScore(cScore);
     setNorelTime(norel);
     setMipFocus(focus);
     setSelectedEdgeCount(markCount);
@@ -1984,6 +2023,7 @@ function App() {
               mipFocus={mipFocus}
               lambdaCoherence={lambdaCoherence}
               minLayerArea={minLayerArea}
+              cutScore={cutScore}
               exportMode={exportMode}
               frameWidthIn={frameWidthIn}
               frameBorderIn={frameBorderIn}
