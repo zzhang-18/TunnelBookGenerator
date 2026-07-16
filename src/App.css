@@ -702,10 +702,10 @@ body {
   align-items: flex-end;
   gap: 14px;
   flex-wrap: wrap;
+  margin-bottom: 16px;
 }
 
 .config-row--frame {
-  margin-top: 10px;
   align-items: flex-end;
   padding: 12px 14px;
   background: rgba(28, 26, 23, 0.03);
@@ -1093,14 +1093,21 @@ body {
 .canvas-tools--stacked {
   flex-direction: column;
   align-items: stretch;
-  gap: 8px;
+  gap: 12px;
 }
 
 .canvas-tools-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
+  row-gap: 6px;
   flex-wrap: wrap;
+}
+
+.canvas-tools-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .canvas-tools-hint {

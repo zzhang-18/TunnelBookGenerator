@@ -2,6 +2,7 @@ import {
   useState,
   useRef,
   useEffect,
+  useMemo,
   type ChangeEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
@@ -42,6 +43,10 @@ type Screen = "home" | "edges" | "output";
 // real boundary far below it. A percentile-of-that-image cutoff self-calibrates instead.
 const AUTO_SELECT_TOP_FRACTION = 0.2;
 type MarkType = "split_soft" | "split_hard" | "delete";
+// "brush"/"erase" are canvas-drag modes, not mark types: brush paints split_soft over every
+// boundary the stroke passes near, erase clears whatever mark (if any) is there. Distinguished
+// from MarkType so `tool` can drive both the click-to-toggle tools and the two drag tools.
+type ToolMode = MarkType | "brush" | "erase";
 type ConnMethod = "flow" | "lazy";
 type CutScore = "laplacian" | "meandiff";
 type EdgeItem = {
@@ -655,7 +660,7 @@ function HomeScreen({
       </div>
 
       {/* ── Row 1b: edge conditioning ── */}
-      <div className="config-row">
+      <div className="config-row" style={{ flexDirection: "column", alignItems: "flex-start", gap: 4 }}>
         <label
           className="config-label"
           style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}
@@ -667,7 +672,7 @@ function HomeScreen({
           />
           <I.Brush size={12} /> condition boundaries on detected edges
         </label>
-        <span className="frame-summary-note" style={{ fontSize: 11, color: "var(--text-dim)" }}>
+        <span style={{ fontSize: 11, color: "var(--text-dim)", marginLeft: 22 }}>
           splits superpixels along real Canny object edges, not just the segmentation tessellation
         </span>
       </div>
@@ -963,7 +968,13 @@ function EdgeSelectionScreen({
   onBack: () => void;
 }) {
   const [marks, setMarks] = useState<Record<number, MarkType>>({});
-  const [tool, setTool] = useState<MarkType>("split_soft");
+  const [tool, setTool] = useState<ToolMode>("split_soft");
+  // brush/erase drag state: brushSize is an image-pixel radius; brushCursor tracks the pointer
+  // in image-pixel coords for the visual radius circle; isPainting is true between pointerdown
+  // and pointerup so pointermove knows whether to keep painting
+  const [brushSize, setBrushSize] = useState(20);
+  const [isPainting, setIsPainting] = useState(false);
+  const [brushCursor, setBrushCursor] = useState<{ x: number; y: number } | null>(null);
   const [objective, setObjective] = useState<"depth" | "cut">("depth");
   const [lambdaDepth, setLambdaDepth] = useState(0);
   const [connectivity, setConnectivity] = useState(true);
@@ -998,23 +1009,104 @@ function EdgeSelectionScreen({
   const [configError, setConfigError] = useState<string | null>(null);
   // point-prompted SAM "select object": click the photo (not an edge) to mark its outline
   const [objectSelectMode, setObjectSelectMode] = useState(false);
+  // "advanced" accordion: objective + connectivity + cut-tuning/solver knobs, collapsed by
+  // default -- most sessions never need to leave depth-fit + default solver settings
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [isSelectingObject, setIsSelectingObject] = useState(false);
   const [selectObjectError, setSelectObjectError] = useState<string | null>(null);
 
-  const TOOLS: { key: MarkType; label: string; color: string }[] = [
+  const TOOLS: { key: ToolMode; label: string; color: string }[] = [
     { key: "split_soft", label: "Soft split", color: "#f59e0b" },
     { key: "split_hard", label: "Hard split", color: "#ef4444" },
     { key: "delete", label: "Delete", color: "#3b82f6" },
+    { key: "brush", label: "Brush", color: "#10b981" },
+    { key: "erase", label: "Erase", color: "#9ca3af" },
   ];
   const colorOf = (m: MarkType) => TOOLS.find((t) => t.key === m)!.color;
 
-  const applyMark = (i: number) =>
+  // click-to-toggle marking (Soft split / Hard split / Delete only -- brush/erase paint via drag)
+  const applyMark = (i: number) => {
+    if (tool !== "split_soft" && tool !== "split_hard" && tool !== "delete") return;
     setMarks((prev) => {
       const next = { ...prev };
       if (next[i] === tool) delete next[i];
       else next[i] = tool;
       return next;
     });
+  };
+
+  // Bounding box per edge (image-pixel space), memoized so brush painting can cheaply reject
+  // edges nowhere near the pointer before checking individual segments.
+  const edgeBBoxes = useMemo(() => edges.map((e) => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const [x1, y1, x2, y2] of e.segments) {
+      minX = Math.min(minX, x1, x2); maxX = Math.max(maxX, x1, x2);
+      minY = Math.min(minY, y1, y2); maxY = Math.max(maxY, y1, y2);
+    }
+    return { minX, minY, maxX, maxY };
+  }), [edges]);
+
+  const edgeNearPoint = (arrIdx: number, x: number, y: number, radius: number) => {
+    const b = edgeBBoxes[arrIdx];
+    if (!b || x < b.minX - radius || x > b.maxX + radius || y < b.minY - radius || y > b.maxY + radius) {
+      return false;
+    }
+    const r2 = radius * radius;
+    for (const [x1, y1, x2, y2] of edges[arrIdx].segments) {
+      const dx1 = x1 - x, dy1 = y1 - y;
+      if (dx1 * dx1 + dy1 * dy1 <= r2) return true;
+      const dx2 = x2 - x, dy2 = y2 - y;
+      if (dx2 * dx2 + dy2 * dy2 <= r2) return true;
+    }
+    return false;
+  };
+
+  // brush: mark every boundary within brushSize of (x, y) as split_soft. erase: clear whatever
+  // mark (if any) is there. Both are drag tools -- see the pointer handlers below.
+  const paintAt = (x: number, y: number) => {
+    if (tool !== "brush" && tool !== "erase") return;
+    setMarks((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      edges.forEach((e, arrIdx) => {
+        if (!edgeNearPoint(arrIdx, x, y, brushSize)) return;
+        if (tool === "brush") {
+          if (next[e.index] !== "split_soft") { next[e.index] = "split_soft"; changed = true; }
+        } else if (next[e.index] !== undefined) {
+          delete next[e.index];
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  };
+
+  const svgImagePoint = (ev: { clientX: number; clientY: number; currentTarget: SVGSVGElement }) => {
+    const rect = ev.currentTarget.getBoundingClientRect();
+    return {
+      x: ((ev.clientX - rect.left) / rect.width) * sessionWidth,
+      y: ((ev.clientY - rect.top) / rect.height) * sessionHeight,
+    };
+  };
+
+  const handleBrushPointerDown = (ev: React.PointerEvent<SVGSVGElement>) => {
+    if (objectSelectMode || (tool !== "brush" && tool !== "erase")) return;
+    ev.currentTarget.setPointerCapture(ev.pointerId);
+    setIsPainting(true);
+    const { x, y } = svgImagePoint(ev);
+    setBrushCursor({ x, y });
+    paintAt(x, y);
+  };
+
+  const handleBrushPointerMove = (ev: React.PointerEvent<SVGSVGElement>) => {
+    if (objectSelectMode || (tool !== "brush" && tool !== "erase")) return;
+    const { x, y } = svgImagePoint(ev);
+    setBrushCursor({ x, y });
+    if (isPainting) paintAt(x, y);
+  };
+
+  const handleBrushPointerUp = () => setIsPainting(false);
+  const handleBrushPointerLeave = () => { setIsPainting(false); setBrushCursor(null); };
 
   const markingsArray = () =>
     Object.entries(marks).map(([index, type]) => ({ index: Number(index), type }));
@@ -1220,14 +1312,12 @@ function EdgeSelectionScreen({
       <div className="canvas-card">
         <div className="canvas-tools canvas-tools--stacked">
           <div className="canvas-tools-row">
-            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>
-              <I.Brush /> tool:
-            </span>
-            {TOOLS.map((t) => (
+            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>tool:</span>
+            {TOOLS.filter((t) => t.key !== "brush" && t.key !== "erase").map((t) => (
               <button
                 key={t.key}
                 className="ctrl-btn"
-                onClick={() => setTool(t.key)}
+                onClick={() => { setTool(t.key); setObjectSelectMode(false); }}
                 style={{
                   borderColor: tool === t.key ? t.color : "transparent",
                   color: tool === t.key ? t.color : "var(--text-dim)",
@@ -1243,10 +1333,57 @@ function EdgeSelectionScreen({
             ))}
             <button
               className="ctrl-btn ctrl-btn--ghost"
+              onClick={() => setMarks({})}
+              disabled={markCount === 0}
+              style={{ marginLeft: "auto" }}
+            >
+              clear all
+            </button>
+          </div>
+          <div className="canvas-tools-row">
+            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>draw:</span>
+            {TOOLS.filter((t) => t.key === "brush" || t.key === "erase").map((t) => (
+              <button
+                key={t.key}
+                className="ctrl-btn"
+                onClick={() => { setTool(t.key); setObjectSelectMode(false); }}
+                title={
+                  t.key === "brush" ? "Drag over the photo to mark every boundary the stroke passes near as a soft split"
+                  : "Drag over the photo to clear whatever mark (of any type) is on boundaries the stroke passes near"
+                }
+                style={{
+                  borderColor: tool === t.key ? t.color : "transparent",
+                  color: tool === t.key ? t.color : "var(--text-dim)",
+                  fontWeight: tool === t.key ? 700 : 400,
+                }}
+              >
+                <span style={{
+                  display: "inline-block", width: 9, height: 9, borderRadius: 2,
+                  background: t.color, marginRight: 6, verticalAlign: "middle",
+                }} />
+                {t.label}
+              </button>
+            ))}
+            {(tool === "brush" || tool === "erase") && (
+              <label title="Radius (image pixels) within which a boundary is painted/erased" style={{ fontSize: 11, color: "var(--text-dim)" }}>
+                size {brushSize}px
+                <input
+                  type="range" min={5} max={80} step={1} value={brushSize}
+                  onChange={(ev) => setBrushSize(Number(ev.target.value))}
+                  style={{ width: 90 }}
+                />
+              </label>
+            )}
+          </div>
+          {/* auto: AI-assisted batch marking (SAM object outline / heuristic ranking) --
+              everything below "advanced" is manual solver/objective tuning */}
+          <div className="canvas-tools-row">
+            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>auto:</span>
+            <button
+              className="ctrl-btn ctrl-btn--ghost"
               onClick={() => setObjectSelectMode((v) => !v)}
               title="Click a point on the photo to run SAM and mark every boundary tracing that object's outline as a soft split -- leaves your existing marks untouched. SAM warms up during upload, so clicks are normally fast; occasionally the first one on a fresh server still needs a moment."
               style={{
-                marginLeft: "auto",
                 borderColor: objectSelectMode ? "var(--ink)" : "transparent",
                 color: objectSelectMode ? "var(--ink)" : "var(--text-dim)",
                 fontWeight: objectSelectMode ? 700 : 400,
@@ -1264,7 +1401,16 @@ function EdgeSelectionScreen({
             >
               <I.Sparkles size={11} /> auto select edges
             </button>
+            <button
+              className="ctrl-btn ctrl-btn--ghost"
+              onClick={() => setAdvancedOpen((v) => !v)}
+              style={{ marginLeft: "auto" }}
+            >
+              {advancedOpen ? <I.ChevronUp size={11} /> : <I.ChevronDown size={11} />} advanced
+            </button>
           </div>
+          {advancedOpen && (
+          <>
           <div className="canvas-tools-row">
             <span className="canvas-tools-hint" style={{ marginRight: 4 }}>objective:</span>
             {([
@@ -1312,35 +1458,13 @@ function EdgeSelectionScreen({
                 ))}
               </div>
             )}
-            {objective === "cut" && (
-              <label
-                title="k-median depth anchor: 0 = pure cut (your marks drive everything); above ~0.5 depth dominates and marks stop mattering"
-                style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)", marginLeft: 8 }}
-              >
-                depth λ {lambdaDepth.toFixed(2)}
-                <input
-                  type="range" min={0} max={1} step={0.05} value={lambdaDepth}
-                  onChange={(ev) => setLambdaDepth(Number(ev.target.value))}
-                  style={{ width: 110 }}
-                />
-              </label>
-            )}
-            {objective === "cut" && (
-              <label
-                title="Area floor: every layer must own at least this fraction of the image (0 = off). If the background dominates the photo, a high floor forces far content to be carved across layers — lower it (5%) to let sky/mountains consolidate"
-                style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)" }}
-              >
-                area floor {(minLayerArea * 100).toFixed(0)}%
-                <input
-                  type="range" min={0} max={0.2} step={0.01} value={minLayerArea}
-                  onChange={(ev) => setMinLayerArea(Number(ev.target.value))}
-                  style={{ width: 90 }}
-                />
-              </label>
-            )}
+          </div>
+          {/* advanced: connectivity/fabrication model -- applies to either objective */}
+          <div className="canvas-tools-row">
+            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>advanced · connectivity:</span>
             <label
               title="Flow connectivity: every retained piece must reach the frame. Off = explore unfabricable layerings (pieces may float)"
-              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)", marginLeft: 8 }}
+              style={{ fontSize: 11, color: "var(--text-dim)" }}
             >
               <input
                 type="checkbox" checked={connectivity}
@@ -1350,7 +1474,7 @@ function EdgeSelectionScreen({
             </label>
             <label
               title="Full backing: once a region shows on layer l, every sheet behind l keeps its material (y = cumsum x). Same front view, simpler MIP, heavier build"
-              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)" }}
+              style={{ fontSize: 11, color: "var(--text-dim)" }}
             >
               <input
                 type="checkbox" checked={yMonotone}
@@ -1360,8 +1484,7 @@ function EdgeSelectionScreen({
             </label>
             <label
               title="Lazy cut-set connectivity: no flow variables; frame-connectivity cuts are added only when a candidate violates them. Same optimum as flow, usually better incumbents on N>=4 cut solves. Needs fabrication ON"
-              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11,
-                       color: "var(--text-dim)", opacity: connectivity ? 1 : 0.4 }}
+              style={{ fontSize: 11, color: "var(--text-dim)", opacity: connectivity ? 1 : 0.4 }}
             >
               <input
                 type="checkbox" checked={lazyConn} disabled={!connectivity}
@@ -1369,30 +1492,39 @@ function EdgeSelectionScreen({
               />
               lazy conn
             </label>
-            <label
-              title="Gurobi NoRelHeurTime=60: spend the first 60s in the no-relaxation heuristic. Rescues incumbents on N>=4 cut solves where the LP bound is useless (cut objective only)"
-              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)" }}
-            >
-              <input
-                type="checkbox" checked={norelOn}
-                onChange={(ev) => setNorelOn(ev.target.checked)}
-              />
-              norel 60s
-            </label>
-            <label
-              title="Gurobi MIPFocus=1: bias the search toward finding feasible solutions over proving bounds (cut objective only)"
-              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)" }}
-            >
-              <input
-                type="checkbox" checked={mipFocusOn}
-                onChange={(ev) => setMipFocusOn(ev.target.checked)}
-              />
-              mip focus
-            </label>
-            {objective === "cut" && (
+          </div>
+          {/* advanced: cut-objective-only tuning -- hidden entirely under depth fit, where none
+              of these knobs do anything (norel/mip focus/coherence are cut-only by their own
+              tooltips; keeping them visible under depth fit was dead UI). Split from the solver
+              row below it so neither row is long enough to wrap unpredictably. */}
+          {objective === "cut" && (
+            <div className="canvas-tools-row">
+              <span className="canvas-tools-hint" style={{ marginRight: 4 }}>advanced · cut tuning:</span>
+              <label
+                title="k-median depth anchor: 0 = pure cut (your marks drive everything); above ~0.5 depth dominates and marks stop mattering"
+                style={{ fontSize: 11, color: "var(--text-dim)" }}
+              >
+                depth λ {lambdaDepth.toFixed(2)}
+                <input
+                  type="range" min={0} max={1} step={0.05} value={lambdaDepth}
+                  onChange={(ev) => setLambdaDepth(Number(ev.target.value))}
+                  style={{ width: 110 }}
+                />
+              </label>
+              <label
+                title="Area floor: every layer must own at least this fraction of the image (0 = off). If the background dominates the photo, a high floor forces far content to be carved across layers — lower it (5%) to let sky/mountains consolidate"
+                style={{ fontSize: 11, color: "var(--text-dim)" }}
+              >
+                area floor {(minLayerArea * 100).toFixed(0)}%
+                <input
+                  type="range" min={0} max={0.2} step={0.01} value={minLayerArea}
+                  onChange={(ev) => setMinLayerArea(Number(ev.target.value))}
+                  style={{ width: 90 }}
+                />
+              </label>
               <label
                 title="Depth-plateau coherence: regions the depth map can't tell apart (gap < 0.02) resist being split across sheets. Fixes arbitrary sky seams / bisected far objects (validated N<=5); on hard 7-layer solves with many marks it can degrade the 180s incumbent — toggle off if layering worsens"
-                style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--text-dim)" }}
+                style={{ fontSize: 11, color: "var(--text-dim)" }}
               >
                 <input
                   type="checkbox" checked={cohOn}
@@ -1400,29 +1532,50 @@ function EdgeSelectionScreen({
                 />
                 coherence
               </label>
-            )}
-            {objective === "cut" && cohOn && (
+              {cohOn && (
+                <label
+                  title="Coherence weight: tie-breaker scale (0.05 default). If it visibly fights the layering, it's too high"
+                  style={{ fontSize: 11, color: "var(--text-dim)" }}
+                >
+                  coh λ {lambdaCoh.toFixed(2)}
+                  <input
+                    type="range" min={0.01} max={0.2} step={0.01} value={lambdaCoh}
+                    onChange={(ev) => setLambdaCoh(Number(ev.target.value))}
+                    style={{ width: 80 }}
+                  />
+                </label>
+              )}
+            </div>
+          )}
+          {/* advanced: Gurobi search-strategy hints (cut objective only) -- split from the cut-
+              tuning row above so neither is long enough to wrap unpredictably */}
+          {objective === "cut" && (
+            <div className="canvas-tools-row">
+              <span className="canvas-tools-hint" style={{ marginRight: 4 }}>advanced · solver:</span>
               <label
-                title="Coherence weight: tie-breaker scale (0.05 default). If it visibly fights the layering, it's too high"
-                style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)" }}
+                title="Gurobi NoRelHeurTime=60: spend the first 60s in the no-relaxation heuristic. Rescues incumbents on N>=4 cut solves where the LP bound is useless (cut objective only)"
+                style={{ fontSize: 11, color: "var(--text-dim)" }}
               >
-                coh λ {lambdaCoh.toFixed(2)}
                 <input
-                  type="range" min={0.01} max={0.2} step={0.01} value={lambdaCoh}
-                  onChange={(ev) => setLambdaCoh(Number(ev.target.value))}
-                  style={{ width: 80 }}
+                  type="checkbox" checked={norelOn}
+                  onChange={(ev) => setNorelOn(ev.target.checked)}
                 />
+                norel 60s
               </label>
-            )}
-            <button
-              className="ctrl-btn ctrl-btn--ghost"
-              onClick={() => setMarks({})}
-              disabled={markCount === 0}
-              style={{ marginLeft: "auto" }}
-            >
-              clear all
-            </button>
-          </div>
+              <label
+                title="Gurobi MIPFocus=1: bias the search toward finding feasible solutions over proving bounds (cut objective only)"
+                style={{ fontSize: 11, color: "var(--text-dim)" }}
+              >
+                <input
+                  type="checkbox" checked={mipFocusOn}
+                  onChange={(ev) => setMipFocusOn(ev.target.checked)}
+                />
+                mip focus
+              </label>
+            </div>
+          )}
+          </>
+          )}
         </div>
 
         {/* named edge configs: save/load the current marks into the session's dataset dir */}
@@ -1530,11 +1683,17 @@ function EdgeSelectionScreen({
           <svg
             style={{
               position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
-              cursor: objectSelectMode ? (isSelectingObject ? "wait" : "crosshair") : undefined,
+              cursor: objectSelectMode ? (isSelectingObject ? "wait" : "crosshair")
+                     : (tool === "brush" || tool === "erase") ? "none" : undefined,
+              touchAction: (tool === "brush" || tool === "erase") ? "none" : undefined,
             }}
             viewBox={`0 0 ${sessionWidth} ${sessionHeight}`}
             preserveAspectRatio="none"
             onClick={handleObjectClick}
+            onPointerDown={handleBrushPointerDown}
+            onPointerMove={handleBrushPointerMove}
+            onPointerUp={handleBrushPointerUp}
+            onPointerLeave={handleBrushPointerLeave}
           >
             {edges.map((e) => {
               const m = marks[e.index];
@@ -1559,6 +1718,16 @@ function EdgeSelectionScreen({
                 </g>
               );
             })}
+            {/* brush/erase radius cursor -- shows exactly what the next paint stroke will reach */}
+            {(tool === "brush" || tool === "erase") && brushCursor && (
+              <circle
+                cx={brushCursor.x} cy={brushCursor.y} r={brushSize}
+                fill={tool === "brush" ? "rgba(16,185,129,0.15)" : "rgba(156,163,175,0.15)"}
+                stroke={tool === "brush" ? "#10b981" : "#9ca3af"}
+                strokeWidth={1.5}
+                pointerEvents="none"
+              />
+            )}
           </svg>
         </div>
       </div>
