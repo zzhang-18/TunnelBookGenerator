@@ -30,10 +30,11 @@ import io
 import json
 import os
 import re
+import time
 import uuid
 import zipfile
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import cv2
 import matplotlib
@@ -59,6 +60,7 @@ from tunnelbook.data.labelmap import build_instance, edge_depth_scores, region_b
 from tunnelbook.data.realimage import compute_depth, segment_image
 from tunnelbook.data.sam_point import get_sam_predictor, predict_point_mask
 from tunnelbook.data.spam_segment import SAM_CHECKPOINT, segment_image_spam
+from tunnelbook.experiment import PipelineParams, Prepared, write_run_artifacts
 from tunnelbook.export import build_layer_ai_docs
 from tunnelbook.export.ai import _detect_texture_edges, _trace_skeleton
 from tunnelbook.model import build_model
@@ -147,6 +149,9 @@ class ExportLayersRequest(SolveRequest):
     mode: str = "engraving"           # "engraving" (cut + engrave outlines) | "outline" (cut only)
     content_width_in: float = 12.0    # physical artwork width; height follows image aspect
     border_in: float = 0.5            # red frame band around each sheet
+    # optional per-layer engrave overrides (length must == n_layers); None = use the global mode/floor
+    engrave_layers: Optional[List[bool]] = None          # per-plane engrave on/off
+    min_engrave_in_per_layer: Optional[List[float]] = None  # per-plane detail floor (inches)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
@@ -364,69 +369,116 @@ def _build_cfg(req: "SolveRequest") -> Config:
                   time_limit=req.time_limit, verbose=False, log_progress=True)
 
 
-def _solve_layers(sess: dict, req: "SolveRequest"):
-    cfg = _build_cfg(req)
-    inst = build_instance(sess["label_map"], sess["depth"], cfg)
+def _req_to_pipeline_params(req: "SolveRequest") -> PipelineParams:
+    """Faithful SolveRequest -> PipelineParams for the run record's config.json.  Branches on the
+    objective to mirror exactly what ``_build_cfg`` passes to ``Config`` -- copying ``req.*`` blindly
+    would misreport the depth branch, which leaves the cut-only knobs (norel/mip_focus/min_layer_*/
+    coherence/contact-weight) at Config defaults.  Segmentation/depth fields stay at defaults;
+    ``write_run_artifacts`` nulls them and records the dataset's frozen provenance instead.  Keep in
+    sync with ``_build_cfg`` above (and ``examples/cluster_sweep.py`` ``_SERVER_CUT_DEFAULTS``)."""
+    common = dict(
+        layers=req.n_layers,
+        time_limit=req.time_limit if req.time_limit is not None else 180.0,
+        bins="linear",              # server's build_instance uses the default depth_method="linear"
+        connectivity=req.connectivity,
+        connectivity_method=req.connectivity_method,
+        y_monotone=req.y_monotone,
+        log_progress=True,          # _build_cfg sets log_progress=True in both branches
+        export_ai=True,             # archive the cut+engrave .ai next to the run, like the sweep
+    )
+    if req.objective == "cut":
+        return PipelineParams(
+            **common,
+            depth_model="kmedian", lambda_depth=req.lambda_depth,
+            lambda_support=0.0, lambda_smooth=0.0,
+            lambda_cut=req.lambda_cut, lambda_split=0.0,
+            cut_cost="aware", cut_score=req.cut_score, cut_log_sigma=req.cut_log_sigma,
+            use_contact_weight=True,
+            min_layer_area=req.min_layer_area, min_layer_regions=req.min_layer_regions,
+            norel_time=req.norel_time, mip_focus=req.mip_focus,
+            lambda_coherence=req.lambda_coherence, coherence_eps=req.coherence_eps,
+            mip_gap=0.02,
+        )
+    # objective == "depth": _build_cfg omits the cut-only knobs -> record Config defaults, not req.*
+    return PipelineParams(
+        **common,
+        depth_model="bins", lambda_depth=1.0, lambda_support=1.0, lambda_smooth=0.0,
+        lambda_cut=0.0, lambda_split=req.lambda_split,
+        cut_cost="uniform", use_contact_weight=False,
+        min_layer_area=0.0, min_layer_regions=0,
+        norel_time=0.0, mip_focus=0, lambda_coherence=0.0,
+        mip_gap=0.01,
+    )
+
+
+def _resolve_markings(inst, markings) -> Dict[str, list]:
+    """Positional edge-index marks -> ``{split_soft|split_hard|delete: [(i, j), ...]}`` region-id
+    pairs against this instance's edge list (out-of-range indices skipped).  Shared by the solve
+    (feeds build_model) and the run record (config.json marks), so both see the same pairs."""
+    out: Dict[str, list] = {"split_soft": [], "split_hard": [], "delete": []}
     n_edges = len(inst.edges)
-    split_soft, split_hard, delete = [], [], []
-    for mk in req.markings:
+    for mk in markings:
         if not (0 <= mk.index < n_edges):
             continue
         i, j = inst.edges[mk.index]
-        pair = (int(i), int(j))
-        if mk.type == "split_soft":
-            split_soft.append(pair)
-        elif mk.type == "split_hard":
-            split_hard.append(pair)
-        elif mk.type == "delete":
-            delete.append(pair)
+        if mk.type in out:
+            out[mk.type].append((int(i), int(j)))
+    return out
+
+
+def _solve_layers(sess: dict, req: "SolveRequest"):
+    """Build the instance + model for this session's marks/config and solve.  Returns
+    ``(inst, sol, timing, marks)`` -- the per-stage timing and the resolved marks are threaded into
+    the run record so a UI solve is persisted with the same schema as a cluster-sweep run."""
+    cfg = _build_cfg(req)
+    timing: Dict[str, float] = {}
+    t = time.perf_counter()
+    inst = build_instance(sess["label_map"], sess["depth"], cfg)
+    timing["build_instance"] = time.perf_counter() - t
+    marks = _resolve_markings(inst, req.markings)
+    t = time.perf_counter()
     # depth_map is needed by the laplacian cut score; harmless for the depth objective.
-    sol = solve(build_model(inst, cfg, depth_map=sess["depth"],
-                            split_soft=split_soft or None,
-                            split_hard=split_hard or None,
-                            delete=delete or None))
-    return inst, sol
+    gm = build_model(inst, cfg, depth_map=sess["depth"],
+                     split_soft=marks["split_soft"] or None,
+                     split_hard=marks["split_hard"] or None,
+                     delete=marks["delete"] or None)
+    timing["build_model"] = time.perf_counter() - t
+    t = time.perf_counter()
+    sol = solve(gm)  # InfeasibleError propagates to the endpoint (never saved on infeasible)
+    timing["solve"] = time.perf_counter() - t
+    return inst, sol, timing, marks
 
 
-def _save_run(session_id: str, req: "SolveRequest", inst, sol,
-              overlay_img: np.ndarray, layer_imgs: List[np.ndarray]) -> str:
-    """Persist one solve: inputs (marks + config) and outputs (overlay + per-layer PNGs)."""
+def _save_run(sess: dict, session_id: str, req: "SolveRequest", inst, sol,
+              timing: Dict[str, float], marks: Dict[str, list]) -> str:
+    """Persist one UI solve through the *same* artifact schema the cluster sweep writes --
+    ``config.json`` / ``metrics.json`` / ``timing.json`` / ``result.npz`` / per-layer ``.ai`` /
+    figures -- via :func:`tunnelbook.experiment.write_run_artifacts`, reusing the already-solved
+    ``(inst, sol)`` (no re-solve).  This makes a UI run reproducible and directly comparable to a
+    sweep row: it records dataset provenance (slug / rgb_md5 / label_map_md5 / seg / depth), the full
+    resolved config, the anytime trajectory, and the solution arrays."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    d = os.path.join(RUNS_DIR, f"{session_id[:8]}_{ts}")
-    os.makedirs(d, exist_ok=True)
-    marks = []
-    for mk in req.markings:
-        if 0 <= mk.index < len(inst.edges):
-            i, j = inst.edges[mk.index]
-            marks.append({"index": mk.index, "i": int(i), "j": int(j), "type": mk.type})
-    meta = {
-        "session": session_id, "timestamp": ts,
-        "n_layers": req.n_layers, "lambda_split": req.lambda_split,
-        "objective_mode": req.objective, "min_layer_regions": req.min_layer_regions,
-        "min_layer_area": req.min_layer_area,
-        "lambda_cut": req.lambda_cut, "cut_score": req.cut_score,
-        # full solver config, so a run dir is never ambiguous about what actually ran
-        "lambda_depth": req.lambda_depth, "cut_log_sigma": req.cut_log_sigma,
-        "time_limit": req.time_limit,
-        "connectivity": req.connectivity, "connectivity_method": req.connectivity_method,
-        "y_monotone": req.y_monotone,
-        "norel_time": req.norel_time, "mip_focus": req.mip_focus,
-        "lambda_coherence": req.lambda_coherence, "coherence_eps": req.coherence_eps,
-        "status": sol.status, "runtime": sol.runtime, "objective": sol.obj_breakdown,
-        # gurobi diagnostics: gap/bound/nodes (+ lazy cut count and k-median z when present)
-        "solver": sol.extra.get("solver"),
-        "lazy_cuts": sol.extra.get("lazy_cuts"),
-        "z": sol.extra.get("z"),
-        "markings": marks, "layer_of": [int(v) for v in sol.layer_of],
-    }
-    with open(os.path.join(d, "run.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-    with open(os.path.join(d, "overlay.png"), "wb") as f:
-        f.write(_png_bytes(overlay_img))
-    for k, im in enumerate(layer_imgs, 1):
-        with open(os.path.join(d, f"layer_{k}.png"), "wb") as f:
-            f.write(_png_bytes(im))
-    return d
+    out_dir = os.path.join(RUNS_DIR, f"{session_id[:8]}_{ts}")
+    p = _req_to_pipeline_params(req)
+    meta = sess.get("dataset_meta")
+    if sess.get("edge_condition"):  # session re-split the frozen label map; record it truthfully
+        p.edge_condition = True
+        p.canny_low = sess.get("canny_low", p.canny_low)
+        p.canny_high = sess.get("canny_high", p.canny_high)
+    prepared = Prepared(
+        slug=sess["dataset_slug"], rgb=sess["rgb"], label_map=sess["label_map"],
+        n_regions=inst.n_regions,  # conditioned count (meta keeps the original md5/n_regions)
+        thresh=str((meta or {}).get("seg", {}).get("backend", "dataset")),
+        depth=sess["depth"], timing=timing, dataset_meta=meta,
+    )
+    # pass the real cfg the solve used so the recorded tau_px is truthful (not remapped from p);
+    # collapse the always-3-key marks dict to {} when empty so config.json matches a no-marks sweep
+    write_run_artifacts(
+        out_dir, p, prepared, inst, sol, timing,
+        image_name=sess.get("filename", "image"), status=sol.status,
+        cfg=_build_cfg(req), marks=(marks if any(marks.values()) else {}),
+        edge_config=None, save_npz=True)
+    return out_dir
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
@@ -482,6 +534,10 @@ async def create_session(
     cfg = Config(n_layers=n_layers, fix_x=False, lambda_support=1.0, verbose=False)
     inst = build_instance(label_map, depth, cfg)
 
+    # frozen dataset provenance for the run record (meta.json describes the *base*, pre-conditioning
+    # segmentation/depth -- the original label_map_md5/n_regions, matching prepare_from_dataset).
+    meta = json.loads((d / "meta.json").read_text())
+
     h, w = rgb.shape[:2]
     session_id = str(uuid.uuid4())
     sess = {
@@ -489,6 +545,9 @@ async def create_session(
         "width": w, "height": h, "filename": image.filename or "image",
         "n_regions": inst.n_regions,
         "dataset_dir": str(d), "dataset_slug": d.name,
+        # provenance threaded into _save_run's config.json (dataset + edge-conditioning knobs)
+        "dataset_meta": meta,
+        "edge_condition": edge_condition, "canny_low": canny_low, "canny_high": canny_high,
     }
     _sessions[session_id] = sess
 
@@ -547,7 +606,7 @@ async def solve_session(session_id: str, req: SolveRequest):
     if not sess:
         raise HTTPException(status_code=404, detail="Unknown session")
     try:
-        inst, sol = _solve_layers(sess, req)
+        inst, sol, timing, marks = _solve_layers(sess, req)
     except InfeasibleError as e:
         raise HTTPException(status_code=409, detail=f"No feasible layering: {e}")
     except ValueError as e:  # e.g. min_layer_regions * n_layers > n_regions
@@ -555,7 +614,7 @@ async def solve_session(session_id: str, req: SolveRequest):
 
     overlay_img = _overlay_img(inst, sol.layer_of, sess["rgb"])
     layer_imgs = _layer_sheets(inst, sol, sess["rgb"])  # retained material (support marked red)
-    run_dir = _save_run(session_id, req, inst, sol, overlay_img, layer_imgs)
+    run_dir = _save_run(sess, session_id, req, inst, sol, timing, marks)
 
     print(f"[solve] {len(req.markings)} marks | N={req.n_layers} | {sol.status} "
           f"obj={sol.obj_total:.3f} in {sol.runtime:.1f}s -> runs/{os.path.basename(run_dir)}")
@@ -689,18 +748,28 @@ async def export_ai(session_id: str, req: ExportLayersRequest):
     if not sess:
         raise HTTPException(status_code=404, detail="Unknown session")
     try:
-        _inst, sol = _solve_layers(sess, req)
+        _inst, sol, _timing, _marks = _solve_layers(sess, req)
     except InfeasibleError as e:
         raise HTTPException(status_code=409, detail=f"No feasible layering: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    n_layers = sol.inst.n_layers
+    for name, arr in (("engrave_layers", req.engrave_layers),
+                      ("min_engrave_in_per_layer", req.min_engrave_in_per_layer)):
+        if arr is not None and len(arr) != n_layers:
+            raise HTTPException(status_code=400,
+                                detail=f"{name} must have length {n_layers}, got {len(arr)}")
+
     try:
         # centerline engrave (single-burn skeleton strokes) -- matches run_one's sweep exports
-        # and the 3D preview's sheet texture; "canny" loops burn every edge twice
+        # and the 3D preview's sheet texture; "canny" loops burn every edge twice.  Per-layer
+        # engrave_layers / min_engrave_in_per_layer override the global mode/floor for that plane.
         docs = build_layer_ai_docs(sol, content_width_in=req.content_width_in,
                                    engrave=(req.mode == "engraving"), border_in=req.border_in,
-                                   rgb=sess["rgb"], engrave_style="centerline")
+                                   rgb=sess["rgb"], engrave_style="centerline",
+                                   engrave_layers=req.engrave_layers,
+                                   min_engrave_in_per_layer=req.min_engrave_in_per_layer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Layer export failed: {e}")
 

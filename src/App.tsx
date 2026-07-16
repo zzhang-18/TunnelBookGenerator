@@ -370,6 +370,8 @@ async function exportLayers(
   mode: ExportMode,
   contentWidthIn: number,
   borderIn: number,
+  engraveLayers: boolean[],
+  minEngraveInPerLayer: number[],
 ): Promise<Blob> {
   const res = await fetch(apiUrl(`/api/sessions/${sessionId}/export-ai`), {
     method: "POST",
@@ -381,6 +383,11 @@ async function exportLayers(
       lambda_coherence: lambdaCoherence, min_layer_area: minLayerArea,
       cut_score: cutScore,
       mode, content_width_in: contentWidthIn, border_in: borderIn,
+      // per-layer engrave overrides (omit when engraving is off / arrays not sized yet)
+      engrave_layers: mode === "engraving" && engraveLayers.length === nLayers
+        ? engraveLayers : null,
+      min_engrave_in_per_layer: mode === "engraving" && minEngraveInPerLayer.length === nLayers
+        ? minEngraveInPerLayer : null,
     }),
   });
   if (!res.ok)
@@ -1883,6 +1890,10 @@ function OutputScreen({
   exportMode,
   frameWidthIn,
   frameBorderIn,
+  engraveLayers,
+  minEngraveInPerLayer,
+  setEngraveLayers,
+  setMinEngraveInPerLayer,
   onBack,
 }: {
   imageFile: File | null;
@@ -1903,6 +1914,10 @@ function OutputScreen({
   exportMode: ExportMode;
   frameWidthIn: number;
   frameBorderIn: number;
+  engraveLayers: boolean[];
+  minEngraveInPerLayer: number[];
+  setEngraveLayers: (v: boolean[]) => void;
+  setMinEngraveInPerLayer: (v: number[]) => void;
   onBack: () => void;
 }) {
   const [isExportingStand, setIsExportingStand] = useState(false);
@@ -1951,6 +1966,7 @@ function OutputScreen({
           connectivity, yMonotone, connectivityMethod, norelTime, mipFocus,
           lambdaCoherence, minLayerArea, cutScore,
           exportMode, frameWidthIn, frameBorderIn,
+          engraveLayers, minEngraveInPerLayer,
         ),
       );
     } catch (err: any) {
@@ -1991,6 +2007,52 @@ function OutputScreen({
           // depth binning + layer assignment → step 2
         </div>
       </div>
+
+      {exportMode === "engraving" && numLayers > 0 && (
+        <div className="output-card" style={{ marginTop: 12 }}>
+          <div className="output-card-header">// per-layer engraving</div>
+          <div style={{ padding: "8px 16px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+            {Array.from({ length: numLayers }).map((_, i) => {
+              const on = engraveLayers[i] ?? true;
+              const floor = minEngraveInPerLayer[i] ?? 0.03;
+              return (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 90, cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      onChange={(e) => {
+                        const next = Array.from({ length: numLayers }, (_, k) => engraveLayers[k] ?? true);
+                        next[i] = e.target.checked;
+                        setEngraveLayers(next);
+                      }}
+                    />
+                    Layer {i + 1}
+                  </label>
+                  <input
+                    type="range"
+                    min={0.01}
+                    max={0.2}
+                    step={0.01}
+                    value={floor}
+                    disabled={!on}
+                    onChange={(e) => {
+                      const next = Array.from({ length: numLayers }, (_, k) => minEngraveInPerLayer[k] ?? 0.03);
+                      next[i] = parseFloat(e.target.value);
+                      setMinEngraveInPerLayer(next);
+                    }}
+                    style={{ flex: 1, opacity: on ? 1 : 0.4 }}
+                    title="Engrave detail floor — lower keeps finer texture, higher de-speckles"
+                  />
+                  <span style={{ minWidth: 68, textAlign: "right", color: "var(--text-dim)" }}>
+                    {on ? `${floor.toFixed(2)}″ detail` : "off"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <div className="output-actions">
         <button
@@ -2059,6 +2121,9 @@ function App() {
   const [cutScore, setCutScore] = useState<CutScore>("laplacian");
   const [regionMap, setRegionMap] = useState<string | null>(null);
   const [regionDepth, setRegionDepth] = useState<number[]>([]);
+  // per-layer engrave overrides (sized to the layer count on solve); [] = use the global mode/floor
+  const [engraveLayers, setEngraveLayers] = useState<boolean[]>([]);
+  const [minEngraveInPerLayer, setMinEngraveInPerLayer] = useState<number[]>([]);
 
   const reset = async () => {
     if (sessionId) await deleteSession(sessionId);
@@ -2076,6 +2141,8 @@ function App() {
     setFrameWidthIn(12);
     setFrameHeightIn(9);
     setFrameBorderIn(0.5);
+    setEngraveLayers([]);
+    setMinEngraveInPerLayer([]);
   };
 
   const handleGo = async (
@@ -2097,6 +2164,8 @@ function App() {
       setImageFile(file);
       setImageUrl(url);
       setTotalLayers(count);
+      setEngraveLayers(Array(count).fill(true));         // all layers engrave by default
+      setMinEngraveInPerLayer(Array(count).fill(0.03));  // default detail floor (exporter default)
       setSessionId(data.sessionId);
       setSessionWidth(data.width);
       setSessionHeight(data.height);
@@ -2196,6 +2265,10 @@ function App() {
               exportMode={exportMode}
               frameWidthIn={frameWidthIn}
               frameBorderIn={frameBorderIn}
+              engraveLayers={engraveLayers}
+              minEngraveInPerLayer={minEngraveInPerLayer}
+              setEngraveLayers={setEngraveLayers}
+              setMinEngraveInPerLayer={setMinEngraveInPerLayer}
               onBack={handleBack}
             />
           )}
