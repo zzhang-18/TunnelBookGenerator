@@ -47,11 +47,14 @@ from PIL import Image
 from pydantic import BaseModel
 from skimage.segmentation import find_boundaries
 
+from pathlib import Path
+
 from tunnelbook.config import Config
 from tunnelbook.data.dataset import (
-    find_dataset, indices_to_pairs, label_map_md5, list_edge_configs,
+    datasets_root, find_dataset, indices_to_pairs, label_map_md5, list_edge_configs,
     load_dataset, load_edge_config, resolve_marks, save_dataset, save_edge_config,
 )
+from tunnelbook.serialize import load_result
 from tunnelbook.data.edges import (
     condition_label_map, detect_canny_raster, edge_canny_alignment, edge_gradient_strength,
     edge_params_for, image_gradient_strength,
@@ -100,18 +103,19 @@ class SolveRequest(BaseModel):
     lambda_split: float = 1.0
     time_limit: Optional[float] = 180.0
     objective: str = "depth"          # "depth" (fixed-bin fidelity) | "cut" (depth-aware cut only)
-    min_layer_area: float = 0.10      # cut objective (DEFAULT floor): force each layer to own >= this fraction of image area
+    min_layer_area: float = 0.04      # cut objective (DEFAULT floor): force each layer to own >= this fraction of image area
     min_layer_regions: int = 0        # cut objective: optional count floor (>= k superpixels/layer); 0 = off (area floor is default)
     lambda_cut: float = 1.0           # cut objective: weight on the boundary-cut term
-    lambda_depth: float = 0.0         # cut objective: k-median depth-anchor strength (0 = pure cut;
+    lambda_depth: float = 0.5         # cut objective: k-median depth-anchor strength (0 = pure cut;
                                       # marks stop mattering above ~0.5, so the useful range is 0..0.5)
     connectivity: bool = True         # flow (fabrication) constraints; off = pieces may float
-    connectivity_method: str = "flow"  # "flow" | "lazy" (cut-set rows added lazily at MIPSOL)
-    y_monotone: bool = False          # y == cumsum(x): "full backing" (fewer free binaries)
+    connectivity_method: str = "lazy"  # "flow" | "lazy" (cut-set rows added lazily at MIPSOL)
+    y_monotone: bool = True           # y == cumsum(x): "full backing" (fewer free binaries); the
+                                      # depth-preview branch pins this back to False (free-y support)
     norel_time: float = 60.0          # cut objective: seconds of Gurobi NoRel heuristic (0 = off);
                                       # rescues N>=4 incumbents (japan N=7: none -> comps 11, rho .90)
     mip_focus: int = 1                # cut objective: Gurobi MIPFocus (1 = feasibility focus)
-    cut_score: str = "laplacian"      # cut objective: "laplacian" | "meandiff"
+    cut_score: str = "meandiff"       # cut objective: "meandiff" (region-level depth gap) | "laplacian"
     cut_log_sigma: float = 2.0        # cut objective: LoG spatial scale (px) for the crease score
     lambda_coherence: float = 0.0     # cut objective: depth-plateau coherence tie-breaker (0 = off).
                                       # ON (0.05) fixes free plateau splits (robert-keane N=5:
@@ -250,8 +254,15 @@ def _layer_sheets(inst, sol, rgb: np.ndarray) -> List[np.ndarray]:
     return out
 
 
-def _layer_masks(inst, sol, rgb: np.ndarray, max_dim: int = 512):
+def _layer_masks(inst, sol, rgb: np.ndarray, max_dim: int = 512, *,
+                 min_engrave_in_per_layer=None, content_width_in: float = 12.0,
+                 engrave: bool = True, engrave_layers=None):
     """Per-layer RGBA textures for the 3D book-stack preview, TWO styles per layer.
+
+    ``min_engrave_in_per_layer`` / ``content_width_in`` set the *per-layer* engrave detail floor
+    (same mapping as the .ai export), so the 3D stack can mirror the density the user is tuning;
+    ``None`` keeps the exporter default 0.03".  ``engrave=False`` (outline mode) or a per-plane
+    ``engrave_layers[l]==False`` draws that sheet with cut lines only, no burns.
 
     Material on each plane is the *retained* sheet (``sol.x`` visible + ``sol.support``), so the
     stack shows the physical pages, not just the visible silhouettes:
@@ -273,7 +284,6 @@ def _layer_masks(inst, sol, rgb: np.ndarray, max_dim: int = 512):
     # (visible-masked Canny -> skeleton -> single-burn polylines with a physical length floor),
     # so the sheet texture shows what actually gets burned -- not the doubled Canny loops.
     from skimage.morphology import skeletonize
-    min_len_px = max(2.0, 0.03 * W / 12.0)   # exporter default: min_engrave_in / content_width_in
     s = max_dim / (max(H, W) + 2 * band)
     photo_out, sheet_out = [], []
     for l in range(inst.n_layers):
@@ -286,14 +296,20 @@ def _layer_masks(inst, sol, rgb: np.ndarray, max_dim: int = 512):
         ph[..., 3] = np.where(mat, 255, 0).astype(np.uint8)
         sh = np.zeros((H, W, 4), dtype=np.uint8)
         sh[..., :3][mat] = paper
-        emap = _detect_texture_edges(rgb, vis, 30, 100)
-        for chain in _trace_skeleton(skeletonize(emap > 0)):
-            if len(chain) < 2:
-                continue
-            seg = np.diff(chain, axis=0)
-            if np.hypot(seg[:, 0], seg[:, 1]).sum() < min_len_px:
-                continue
-            cv2.polylines(sh, [chain.round().astype(np.int32)], False, (*ink, 255), 2)
+        floor_l = (min_engrave_in_per_layer[l]
+                   if min_engrave_in_per_layer and l < len(min_engrave_in_per_layer) else 0.03)
+        min_len_px = max(2.0, float(floor_l) * W / max(1e-6, float(content_width_in)))
+        on_l = engrave and (engrave_layers[l]
+                            if engrave_layers and l < len(engrave_layers) else True)
+        if on_l:
+            emap = _detect_texture_edges(rgb, vis, 30, 100)
+            for chain in _trace_skeleton(skeletonize(emap > 0)):
+                if len(chain) < 2:
+                    continue
+                seg = np.diff(chain, axis=0)
+                if np.hypot(seg[:, 0], seg[:, 1]).sum() < min_len_px:
+                    continue
+                cv2.polylines(sh, [chain.round().astype(np.int32)], False, (*ink, 255), 2)
         cut = cv2.morphologyEx(mat.astype(np.uint8), cv2.MORPH_GRADIENT,
                                np.ones((3, 3), np.uint8)) > 0
         sh[..., :3][cut] = red
@@ -310,6 +326,52 @@ def _layer_masks(inst, sol, rgb: np.ndarray, max_dim: int = 512):
         photo_out.append(ph)
         sheet_out.append(sh)
     return photo_out, sheet_out
+
+
+def _engrave_preview_img(sol, rgb: np.ndarray, layer: int, min_engrave_in: float,
+                         content_width_in: float, engrave: bool, max_dim: int = 640):
+    """Render ONE layer's fabrication sheet (paper + centerline engrave at the given detail floor
+    + red cut lines) as an RGBA preview -- the same machinery as :func:`_layer_masks` / the .ai
+    exporter, but a single plane with a *parameterized* engrave floor, so the UI can show what a
+    given per-layer ``min_engrave_in`` actually burns.  Reads the cached solution -- no solving.
+    Returns ``(rgba_uint8, n_strokes)``."""
+    from skimage.morphology import skeletonize
+    inst = sol.inst
+    H, W = rgb.shape[:2]
+    band = max(8, round(0.04 * max(H, W)))
+    paper = np.array([243, 240, 232], dtype=np.uint8)
+    ink, red = (64, 60, 54), (198, 40, 40)
+    l = max(0, min(int(layer), inst.n_layers - 1))
+    # exporter mapping: a stroke shorter than min_engrave_in inches -- at print scale where W px
+    # spans content_width_in inches -- is dropped, so a higher floor burns fewer, longer strokes.
+    min_len_px = max(2.0, float(min_engrave_in) * W / max(1e-6, float(content_width_in)))
+    vis = inst.paint(sol.x[:, l].astype(float), fill=0.0) > 0.5
+    sup = inst.paint(sol.support[:, l].astype(float), fill=0.0) > 0.5
+    mat = vis | sup
+    sh = np.zeros((H, W, 4), dtype=np.uint8)
+    sh[..., :3][mat] = paper
+    n_strokes = 0
+    if engrave:
+        emap = _detect_texture_edges(rgb, vis, 30, 100)
+        for chain in _trace_skeleton(skeletonize(emap > 0)):
+            if len(chain) < 2:
+                continue
+            seg = np.diff(chain, axis=0)
+            if np.hypot(seg[:, 0], seg[:, 1]).sum() < min_len_px:
+                continue
+            cv2.polylines(sh, [chain.round().astype(np.int32)], False, (*ink, 255), 2)
+            n_strokes += 1
+    cut = cv2.morphologyEx(mat.astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+    sh[..., :3][cut] = red
+    sh[..., 3] = np.where(mat | cut, 255, 0).astype(np.uint8)
+    sh = cv2.copyMakeBorder(sh, band, band, band, band, cv2.BORDER_CONSTANT,
+                            value=(int(paper[0]), int(paper[1]), int(paper[2]), 255))
+    cv2.rectangle(sh, (1, 1), (sh.shape[1] - 2, sh.shape[0] - 2), (*red, 255), 2)
+    s = max_dim / max(sh.shape[0], sh.shape[1])
+    if s < 1:
+        sh = cv2.resize(sh, (max(1, round(sh.shape[1] * s)), max(1, round(sh.shape[0] * s))),
+                        interpolation=cv2.INTER_AREA)
+    return sh, n_strokes
 
 
 def _edges_payload(inst, scores=None, canny_align=None) -> List[dict]:
@@ -360,12 +422,14 @@ def _build_cfg(req: "SolveRequest") -> Config:
                       lambda_split=0.0, mip_gap=0.02,
                       time_limit=req.time_limit, verbose=False,
                       log_progress=True)  # stream incumbents (+ z medians) to the console
-    # depth objective solves in seconds -- the NoRel/MIPFocus rescue is left off here
+    # depth objective solves in seconds -- the NoRel/MIPFocus rescue is left off here.
+    # y_monotone is pinned False: this branch prices hidden support (lambda_support=1.0), which
+    # is only meaningful with free y -- full backing would make it the degenerate A_r(N-1-L_r).
     return Config(n_layers=req.n_layers, fix_x=False, lambda_support=1.0,
                   lambda_split=req.lambda_split, mip_gap=0.01,
                   connectivity=req.connectivity,
                   connectivity_method=req.connectivity_method,
-                  y_monotone=req.y_monotone,
+                  y_monotone=False,
                   time_limit=req.time_limit, verbose=False, log_progress=True)
 
 
@@ -382,13 +446,13 @@ def _req_to_pipeline_params(req: "SolveRequest") -> PipelineParams:
         bins="linear",              # server's build_instance uses the default depth_method="linear"
         connectivity=req.connectivity,
         connectivity_method=req.connectivity_method,
-        y_monotone=req.y_monotone,
         log_progress=True,          # _build_cfg sets log_progress=True in both branches
         export_ai=True,             # archive the cut+engrave .ai next to the run, like the sweep
     )
     if req.objective == "cut":
         return PipelineParams(
             **common,
+            y_monotone=req.y_monotone,   # full backing on the cut objective
             depth_model="kmedian", lambda_depth=req.lambda_depth,
             lambda_support=0.0, lambda_smooth=0.0,
             lambda_cut=req.lambda_cut, lambda_split=0.0,
@@ -400,8 +464,10 @@ def _req_to_pipeline_params(req: "SolveRequest") -> PipelineParams:
             mip_gap=0.02,
         )
     # objective == "depth": _build_cfg omits the cut-only knobs -> record Config defaults, not req.*
+    # (and pins y_monotone False so hidden support stays free-y, matching _build_cfg)
     return PipelineParams(
         **common,
+        y_monotone=False,
         depth_model="bins", lambda_depth=1.0, lambda_support=1.0, lambda_smooth=0.0,
         lambda_cut=0.0, lambda_split=req.lambda_split,
         cut_cost="uniform", use_contact_weight=False,
@@ -424,6 +490,26 @@ def _resolve_markings(inst, markings) -> Dict[str, list]:
         if mk.type in out:
             out[mk.type].append((int(i), int(j)))
     return out
+
+
+def _solve_signature(req: "SolveRequest") -> tuple:
+    """A hashable fingerprint of everything that affects the *solve*, used to decide whether a
+    cached ``sess["sol"]`` can be reused for export instead of re-solving (see ``export_ai``).
+
+    Deliberately over exactly the solve-affecting fields the ``/export-ai`` payload also sends, so
+    a solve and the export that follows it produce the *same* fingerprint.  Solve-only knobs the
+    export payload never carries (``lambda_split``, ``cut_log_sigma``, ``min_layer_regions``,
+    ``time_limit``, ``lambda_cut``) are excluded: on export they fall back to ``SolveRequest``
+    defaults, so including them would spuriously miss the cache and trigger a needless re-solve."""
+    marks = tuple(sorted((int(m.index), str(m.type)) for m in (req.markings or [])))
+    def _r(x):
+        return round(float(x), 6)
+    return (
+        marks, int(req.n_layers), str(req.objective), _r(req.lambda_depth),
+        bool(req.connectivity), str(req.connectivity_method), bool(req.y_monotone),
+        _r(req.norel_time), int(req.mip_focus), _r(req.lambda_coherence),
+        _r(req.min_layer_area), str(req.cut_score),
+    )
 
 
 def _solve_layers(sess: dict, req: "SolveRequest"):
@@ -612,6 +698,11 @@ async def solve_session(session_id: str, req: SolveRequest):
     except ValueError as e:  # e.g. min_layer_regions * n_layers > n_regions
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Cache the solved (inst, sol) so a following /export-ai with the same solve params reuses it
+    # instead of re-solving (a time-limited MIP would otherwise burn ~time_limit again AND could
+    # return a *different* incumbent than the one previewed here).
+    sess.update(inst=inst, sol=sol, solve_sig=_solve_signature(req), marks=marks)
+
     overlay_img = _overlay_img(inst, sol.layer_of, sess["rgb"])
     layer_imgs = _layer_sheets(inst, sol, sess["rgb"])  # retained material (support marked red)
     run_dir = _save_run(sess, session_id, req, inst, sol, timing, marks)
@@ -742,17 +833,29 @@ async def export_stand(session_id: str, req: StandRequest):
 
 @app.post("/api/sessions/{session_id}/export-ai")
 async def export_ai(session_id: str, req: ExportLayersRequest):
-    """Re-solve with the current marks/config and return a zip of per-layer ``.ai`` sheets
-    (cut silhouette + engrave outlines), built by the shared ``export.build_layer_ai_docs``."""
+    """Return a zip of per-layer ``.ai`` sheets (cut silhouette + engrave outlines), built by the
+    shared ``export.build_layer_ai_docs``.
+
+    Export settings (mode, per-layer engrave density) do **not** affect the solve, so if the
+    session already holds a solution for these exact solve params -- from the interactive solve, a
+    prior export, or a loaded run -- it is reused and nothing re-solves.  Only a genuine change to
+    the solve params (or exporting before any solve) triggers a solve; that result is cached too.
+    """
     sess = _sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Unknown session")
-    try:
-        _inst, sol, _timing, _marks = _solve_layers(sess, req)
-    except InfeasibleError as e:
-        raise HTTPException(status_code=409, detail=f"No feasible layering: {e}")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    sig = _solve_signature(req)
+    sol = sess.get("sol")
+    if sol is None or sess.get("solve_sig") != sig:
+        try:
+            _inst, sol, _timing, _marks = _solve_layers(sess, req)
+        except InfeasibleError as e:
+            raise HTTPException(status_code=409, detail=f"No feasible layering: {e}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        sess.update(inst=_inst, sol=sol, solve_sig=sig, marks=_marks)
+    else:
+        print(f"[export] reusing cached solve for {session_id[:8]} (no re-solve)")
 
     n_layers = sol.inst.n_layers
     for name, arr in (("engrave_layers", req.engrave_layers),
@@ -780,6 +883,260 @@ async def export_ai(session_id: str, req: ExportLayersRequest):
     base = re.sub(r"[^\x00-\x7F]+", "_", sess["filename"].rsplit(".", 1)[0])
     return Response(content=buf.getvalue(), media_type="application/zip",
                     headers={"Content-Disposition": f'attachment; filename="{base}_layers.zip"'})
+
+
+class EngravePreviewRequest(BaseModel):
+    layer: int = 0
+    min_engrave_in: float = 0.03
+    content_width_in: float = 12.0
+    mode: str = "engraving"          # "engraving" | "outline" (outline = cut only, no burns)
+
+
+@app.post("/api/sessions/{session_id}/engrave-preview")
+def engrave_preview(session_id: str, req: EngravePreviewRequest):
+    """Render one layer's fabrication sheet at a given engrave detail floor, from the session's
+    cached solution -- no solving.  Pairs the per-layer density slider with a live view of exactly
+    what that floor burns (same centerlines the .ai export writes)."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown session")
+    sol = sess.get("sol")
+    if sol is None:
+        raise HTTPException(status_code=409, detail="No solution yet -- solve or load a run first")
+    img, n_strokes = _engrave_preview_img(
+        sol, sess["rgb"], req.layer, req.min_engrave_in, req.content_width_in,
+        engrave=(req.mode == "engraving"))
+    return {"image": _data_url(_png_bytes_rgba(img)), "layer": int(req.layer), "nStrokes": n_strokes}
+
+
+class LayerStackRequest(BaseModel):
+    min_engrave_in_per_layer: Optional[List[float]] = None
+    content_width_in: float = 12.0
+    mode: str = "engraving"                 # "engraving" | "outline"
+    engrave_layers: Optional[List[bool]] = None
+
+
+@app.post("/api/sessions/{session_id}/layer-stack")
+def layer_stack(session_id: str, req: LayerStackRequest):
+    """All layers' 3D-stack textures (photo + fabrication sheet) from the cached solve, rendered at
+    the given per-layer engrave densities -- no solving.  Feeds the ``BookVisualizer`` so the 3D
+    tunnel-book preview mirrors exactly the density the user is tuning."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown session")
+    sol = sess.get("sol")
+    if sol is None:
+        raise HTTPException(status_code=409, detail="No solution yet -- solve or load a run first")
+    photo, sheet = _layer_masks(
+        sol.inst, sol, sess["rgb"],
+        min_engrave_in_per_layer=req.min_engrave_in_per_layer,
+        content_width_in=req.content_width_in, engrave=(req.mode == "engraving"),
+        engrave_layers=req.engrave_layers)
+    return {"masks": [_data_url(_png_bytes_rgba(m)) for m in photo],
+            "sheetMasks": [_data_url(_png_bytes_rgba(m)) for m in sheet]}
+
+
+# ── load a previous solve (re-export at new settings without re-solving) ─────────
+#
+# Every solve -- a UI run (RUNS_DIR) or a cluster sweep (image_outputs/) -- persists a full
+# result.npz (tunnelbook.serialize) that load_result() round-trips back into a Solution.  The
+# export path (build_layer_ai_docs) needs only that Solution + the source photo, so a saved solve
+# can be loaded into a fresh session and re-exported at any per-layer engrave density with zero
+# solving.  The photo isn't in the npz; it comes from the run's dataset (datasets/<slug>).
+def _run_roots() -> List[tuple]:
+    """(label, abs_root) dirs scanned for saved runs: the UI's own ``runs/`` plus the repo's
+    ``image_outputs/`` (cluster sweeps) and any ``TUNNELBOOK_RUN_ROOTS`` (os.pathsep-separated).
+    Order is stable, so a run id's root index means the same thing between list and load."""
+    roots = [("ui", RUNS_DIR)]
+    try:
+        img = os.path.join(os.path.dirname(str(datasets_root())), "image_outputs")
+        roots.append(("sweeps", img))
+    except Exception:
+        pass
+    for extra in filter(None, os.environ.get("TUNNELBOOK_RUN_ROOTS", "").split(os.pathsep)):
+        roots.append((os.path.basename(extra.rstrip("/\\")) or "runs", extra))
+    seen, out = set(), []
+    for label, r in roots:
+        rp = os.path.realpath(r)
+        if os.path.isdir(rp) and rp not in seen:
+            seen.add(rp)
+            out.append((label, rp))
+    return out
+
+
+def _encode_run_id(root_idx: int, run_dir: str, root: str) -> str:
+    raw = f"{root_idx}:{os.path.relpath(run_dir, root)}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def _decode_run_id(run_id: str) -> str:
+    """run_id -> validated absolute run dir (inside one of the roots, containing result.npz).
+    Guards against path traversal: the resolved dir must stay within its declared root."""
+    try:
+        raw = base64.urlsafe_b64decode(run_id.encode()).decode()
+        idx_s, rel = raw.split(":", 1)
+        root_idx = int(idx_s)
+    except Exception:
+        raise HTTPException(status_code=400, detail="malformed run id")
+    roots = _run_roots()
+    if not 0 <= root_idx < len(roots):
+        raise HTTPException(status_code=404, detail="unknown run root")
+    root = roots[root_idx][1]
+    cand = os.path.realpath(os.path.join(root, rel))
+    if os.path.commonpath([cand, root]) != root:
+        raise HTTPException(status_code=400, detail="run id escapes its root")
+    if not os.path.isfile(os.path.join(cand, "result.npz")):
+        raise HTTPException(status_code=404, detail="run has no result.npz")
+    return cand
+
+
+def _run_display_config(cfg: dict) -> dict:
+    """config.json (PipelineParams space) -> the SolveRequest/frontend knobs, inverting
+    ``_req_to_pipeline_params``.  ``depth_model=="kmedian"`` is the server's cut branch."""
+    objective = "cut" if cfg.get("depth_model") == "kmedian" else "depth"
+    return {
+        "objective": objective,
+        "nLayers": int(cfg.get("layers", 5)),
+        "lambdaDepth": float(cfg.get("lambda_depth", 0.0)) if objective == "cut" else 0.0,
+        "minLayerArea": float(cfg.get("min_layer_area", 0.10)),
+        "cutScore": cfg.get("cut_score", "laplacian"),
+        "cutLogSigma": float(cfg.get("cut_log_sigma", 2.0)),
+        "connectivity": bool(cfg.get("connectivity", True)),
+        "connectivityMethod": cfg.get("connectivity_method", "flow"),
+        "yMonotone": bool(cfg.get("y_monotone", False)),
+        "norelTime": float(cfg.get("norel_time", 60.0)),
+        "mipFocus": int(cfg.get("mip_focus", 1)),
+        "lambdaCoherence": float(cfg.get("lambda_coherence", 0.0)),
+        "lambdaSplit": float(cfg.get("lambda_split", 1.0)),
+    }
+
+
+def _run_thumb(run_dir: str, width: int = 220) -> Optional[str]:
+    """Small JPEG data URL from the run's overview.png (or None); lets the picker show the run."""
+    fp = os.path.join(run_dir, "overview.png")
+    if not os.path.isfile(fp):
+        return None
+    try:
+        img = cv2.imread(fp)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        if w > width:
+            img = cv2.resize(img, (width, max(1, round(h * width / w))),
+                             interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode() if ok else None
+    except Exception:
+        return None
+
+
+def _run_meta(run_dir: str, root_idx: int, root: str, label: str, with_thumb: bool) -> dict:
+    try:
+        cfg = json.loads((Path(run_dir) / "config.json").read_text())
+    except Exception:
+        cfg = {}
+    status = obj = None
+    rowfp = Path(run_dir) / "row.json"
+    if rowfp.is_file():
+        try:
+            row = json.loads(rowfp.read_text())
+            status, obj = row.get("status"), row.get("obj_total")
+        except Exception:
+            pass
+    disp = _run_display_config(cfg)
+    meta = {
+        "id": _encode_run_id(root_idx, run_dir, root),
+        "name": os.path.basename(run_dir),
+        "source": label,
+        "slug": (cfg.get("dataset") or {}).get("slug"),
+        "nLayers": disp["nLayers"], "objective": disp["objective"],
+        "cutScore": disp["cutScore"], "lambdaDepth": disp["lambdaDepth"],
+        "minLayerArea": disp["minLayerArea"], "status": status, "objTotal": obj,
+        "mtime": os.path.getmtime(run_dir),
+    }
+    if with_thumb:
+        meta["thumb"] = _run_thumb(run_dir)
+    return meta
+
+
+@app.get("/api/runs")
+def list_runs(limit: int = 40, thumbs: bool = True):
+    """Saved solves across the run roots, most-recent first, each re-exportable via /api/load-run."""
+    found = []
+    for root_idx, (label, root) in enumerate(_run_roots()):
+        for dirpath, dirnames, filenames in os.walk(root):
+            if "result.npz" in filenames:
+                found.append((os.path.getmtime(dirpath), root_idx, label, root, dirpath))
+                dirnames[:] = []  # a run dir holds no nested runs -- don't descend
+            if len(found) >= 4000:
+                break
+    found.sort(key=lambda t: t[0], reverse=True)
+    found = found[:max(1, min(int(limit), 200))]
+    return {"runs": [_run_meta(d, ri, root, label, thumbs) for _mt, ri, label, root, d in found]}
+
+
+class LoadRunRequest(BaseModel):
+    runId: str
+
+
+@app.post("/api/load-run")
+def load_run(req: LoadRunRequest):
+    """Hydrate a fresh session from a saved run's result.npz (+ its dataset photo) and return the
+    solved layering + its config.  Export then reuses this solution -- change the per-layer engrave
+    density and re-export with no solve.  (Changing a *solve* param would re-solve, as usual.)"""
+    run_dir = _decode_run_id(req.runId)
+    try:
+        cfg = json.loads((Path(run_dir) / "config.json").read_text())
+    except Exception:
+        cfg = {}
+    slug = (cfg.get("dataset") or {}).get("slug")
+    if not slug:
+        raise HTTPException(status_code=400,
+                            detail="run has no dataset provenance; cannot recover its source image")
+    dset_dir = Path(datasets_root()) / slug
+    if not (dset_dir / "meta.json").is_file():
+        raise HTTPException(status_code=404,
+                            detail=f"dataset {slug!r} not found under {datasets_root()}; "
+                                   "cannot recover the source image for this run")
+    try:
+        sol = load_result(str(Path(run_dir) / "result.npz"))  # the solve, straight from disk
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"could not load solution: {e}")
+    inst = sol.inst
+    b = load_dataset(dset_dir)                                 # source photo + depth (npz has neither)
+    rgb, depth = b.rgb, b.depth
+    disp = _run_display_config(cfg)
+    n = inst.n_layers
+
+    # A SolveRequest carrying this run's solve params (no marks): its signature is what the frontend
+    # reproduces on export, so the loaded sol is reused instead of re-solved.
+    req0 = SolveRequest(
+        markings=[], n_layers=n, objective=disp["objective"], lambda_depth=disp["lambdaDepth"],
+        min_layer_area=disp["minLayerArea"], connectivity=disp["connectivity"],
+        connectivity_method=disp["connectivityMethod"], y_monotone=disp["yMonotone"],
+        norel_time=disp["norelTime"], mip_focus=disp["mipFocus"],
+        lambda_coherence=disp["lambdaCoherence"], cut_score=disp["cutScore"],
+        cut_log_sigma=disp["cutLogSigma"], lambda_split=disp["lambdaSplit"],
+    )
+    session_id = str(uuid.uuid4())
+    _sessions[session_id] = {
+        "rgb": rgb, "label_map": inst.label_map, "depth": depth, "inst": inst,
+        "sol": sol, "solve_sig": _solve_signature(req0), "marks": None,
+        "width": rgb.shape[1], "height": rgb.shape[0], "filename": os.path.basename(run_dir),
+        "n_regions": inst.n_regions, "dataset_dir": str(dset_dir), "dataset_slug": slug,
+        "dataset_meta": b.meta, "edge_condition": bool(cfg.get("edge_condition", False)),
+        "canny_low": int(cfg.get("canny_low", 50)), "canny_high": int(cfg.get("canny_high", 150)),
+        "loaded_from": run_dir,
+    }
+    print(f"[load-run] {os.path.basename(run_dir)} -> session {session_id[:8]} "
+          f"| {slug} | N={n} | {sol.status}")
+    return {
+        "sessionId": session_id, "nLayers": n, "status": sol.status, "runtime": sol.runtime,
+        "objective": sol.obj_breakdown, "layerOf": [int(v) for v in sol.layer_of],
+        "z": sol.extra.get("z"),
+        "overlay": _data_url(_png_bytes(_overlay_img(inst, sol.layer_of, rgb))),
+        "datasetSlug": slug, "runName": os.path.basename(run_dir), "config": disp,
+    }
 
 
 if __name__ == "__main__":

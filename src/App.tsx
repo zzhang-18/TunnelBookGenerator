@@ -353,6 +353,120 @@ async function exportStand(
   return res.blob();
 }
 
+// A previously-saved solve (a UI run or a cluster-sweep run) that can be reloaded and re-exported
+// at new settings without re-solving. See the server's /api/runs and /api/load-run.
+interface RunItem {
+  id: string;
+  name: string;
+  source: string;              // "ui" | "sweeps" | ...
+  slug: string | null;
+  nLayers: number;
+  objective: string;
+  cutScore: string;
+  lambdaDepth: number;
+  minLayerArea: number;
+  status: string | null;
+  objTotal: number | null;
+  mtime: number;
+  thumb?: string | null;
+}
+
+async function listRuns(limit = 40): Promise<RunItem[]> {
+  const res = await fetch(apiUrl(`/api/runs?limit=${limit}`));
+  if (!res.ok)
+    throw new Error(
+      (await res.text().catch(() => "")) || `List runs failed (${res.status})`,
+    );
+  return (await res.json()).runs as RunItem[];
+}
+
+interface LoadRunResult {
+  sessionId: string;
+  nLayers: number;
+  status: string;
+  runtime: number;
+  overlay: string | null;
+  datasetSlug: string;
+  runName: string;
+  config: {
+    objective: "depth" | "cut";
+    nLayers: number;
+    lambdaDepth: number;
+    minLayerArea: number;
+    cutScore: CutScore;
+    cutLogSigma: number;
+    connectivity: boolean;
+    connectivityMethod: ConnMethod;
+    yMonotone: boolean;
+    norelTime: number;
+    mipFocus: number;
+    lambdaCoherence: number;
+    lambdaSplit: number;
+  };
+}
+
+async function loadRun(runId: string): Promise<LoadRunResult> {
+  const res = await fetch(apiUrl(`/api/load-run`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ runId }),
+  });
+  if (!res.ok)
+    throw new Error(
+      (await res.text().catch(() => "")) || `Load run failed (${res.status})`,
+    );
+  return res.json();
+}
+
+// Live preview of one layer's engrave at a given detail floor, rendered from the cached solve
+// (no re-solving). Pairs the per-layer density slider with a view of what it actually burns.
+async function engravePreview(
+  sessionId: string,
+  layer: number,
+  minEngraveIn: number,
+  contentWidthIn: number,
+  mode: ExportMode,
+): Promise<{ image: string; layer: number; nStrokes: number }> {
+  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/engrave-preview`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      layer, min_engrave_in: minEngraveIn, content_width_in: contentWidthIn, mode,
+    }),
+  });
+  if (!res.ok)
+    throw new Error(
+      (await res.text().catch(() => "")) || `Preview failed (${res.status})`,
+    );
+  return res.json();
+}
+
+// All-layer 3D-stack textures from the cached solve at the given per-layer densities (no solve),
+// feeding the BookVisualizer so the 3D preview reflects what the user is tuning.
+async function layerStack(
+  sessionId: string,
+  minEngraveInPerLayer: number[],
+  contentWidthIn: number,
+  mode: ExportMode,
+  engraveLayers: boolean[],
+): Promise<{ masks: string[]; sheetMasks: string[] }> {
+  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/layer-stack`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      min_engrave_in_per_layer: minEngraveInPerLayer.length ? minEngraveInPerLayer : null,
+      content_width_in: contentWidthIn,
+      mode,
+      engrave_layers: engraveLayers.length ? engraveLayers : null,
+    }),
+  });
+  if (!res.ok)
+    throw new Error(
+      (await res.text().catch(() => "")) || `Layer stack failed (${res.status})`,
+    );
+  return res.json();
+}
+
 async function exportLayers(
   sessionId: string,
   markings: { index: number; type: MarkType }[],
@@ -494,8 +608,98 @@ function Sidebar({
 
 // ─── Home Screen ──────────────────────────────────────────────────────────────
 
+// ─── Load-a-previous-solve picker ─────────────────────────────────────────────
+// Lists saved solves (UI runs + cluster sweeps) and reopens one so its export settings /
+// per-layer engrave density can be changed and re-exported with no re-solving.
+function LoadRunModal({ onPick, onClose }: {
+  onPick: (id: string) => void;
+  onClose: () => void;
+}) {
+  const [runs, setRuns] = useState<RunItem[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [loadingId, setLoadingId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    listRuns(60)
+      .then((r) => { if (alive) setRuns(r); })
+      .catch((e) => { if (alive) setErr(e?.message ?? "Failed to list runs"); });
+    return () => { alive = false; };
+  }, []);
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div
+        className="modal-card"
+        onClick={(e) => e.stopPropagation()}
+        style={{ maxWidth: 820, width: "92%", maxHeight: "82vh", display: "flex", flexDirection: "column" }}
+      >
+        <button className="modal-close" onClick={onClose}>×</button>
+        <div className="modal-title"><I.RotateCcw /> Load a previous solve</div>
+        <p style={{ color: "var(--text-dim)", fontSize: 12, margin: "0 0 12px" }}>
+          Reopen a saved layering to change export settings and vary per-layer engrave density —
+          nothing re-solves.
+        </p>
+        {err && <div style={{ color: "var(--coral)", fontSize: 12, padding: 8 }}>{err}</div>}
+        {!runs && !err && (
+          <div style={{ padding: 20, color: "var(--text-dim)" }}>Loading runs…</div>
+        )}
+        {runs && runs.length === 0 && (
+          <div style={{ padding: 20, color: "var(--text-dim)" }}>No saved runs found.</div>
+        )}
+        {runs && runs.length > 0 && (
+          <div
+            style={{
+              overflowY: "auto", display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: 10, paddingRight: 4,
+            }}
+          >
+            {runs.map((r) => (
+              <button
+                key={r.id}
+                disabled={!!loadingId}
+                onClick={() => { setLoadingId(r.id); onPick(r.id); }}
+                title={r.name}
+                style={{
+                  textAlign: "left", border: "1px solid var(--border-dim)",
+                  borderRadius: "var(--r-md)", background: "var(--bg-card)", padding: 8,
+                  cursor: loadingId ? "wait" : "pointer",
+                  opacity: loadingId && loadingId !== r.id ? 0.45 : 1,
+                }}
+              >
+                {r.thumb ? (
+                  <img
+                    src={r.thumb} alt={r.name}
+                    style={{ width: "100%", borderRadius: "var(--r-sm)", display: "block" }}
+                  />
+                ) : (
+                  <div style={{ height: 88, background: "var(--bg-main)", borderRadius: "var(--r-sm)" }} />
+                )}
+                <div style={{ fontSize: 11, marginTop: 6, color: "var(--text-hi)", wordBreak: "break-word" }}>
+                  {loadingId === r.id ? "loading…" : (r.slug ?? r.name)}
+                </div>
+                <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 3 }}>
+                  {r.nLayers} layers · {r.objective}
+                  {r.objective === "cut" ? ` · ${r.cutScore} · λd ${r.lambdaDepth}` : ""}
+                </div>
+                <div style={{
+                  fontSize: 9.5, color: "var(--text-lo)", marginTop: 2,
+                  display: "flex", justifyContent: "space-between",
+                }}>
+                  <span>{r.status ?? ""}</span><span>{r.source}</span>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function HomeScreen({
   onGo,
+  onLoadRun,
   isStarting,
   error,
   exportMode,
@@ -506,11 +710,13 @@ function HomeScreen({
     frameWidthIn: number, frameHeightIn: number, frameBorderIn: number,
     edgeCondition: boolean,
   ) => void;
+  onLoadRun: (runId: string) => void;
   isStarting: boolean;
   error: string | null;
   exportMode: ExportMode;
   onExportModeChange: (m: ExportMode) => void;
 }) {
+  const [showLoad, setShowLoad] = useState(false);
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [layerCount, setLayerCount] = useState("");
@@ -577,6 +783,23 @@ function HomeScreen({
           <span className="home-step-arrow">→</span>
           <span className="home-step"><I.Download size={11} /> export cut files</span>
         </div>
+      </div>
+
+      {showLoad && (
+        <LoadRunModal
+          onPick={(id) => { setShowLoad(false); onLoadRun(id); }}
+          onClose={() => setShowLoad(false)}
+        />
+      )}
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 12 }}>
+        <button
+          className="mode-toggle-btn"
+          onClick={() => setShowLoad(true)}
+          style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+          title="Reopen a saved solve to change export settings / per-layer engrave density (no re-solve)"
+        >
+          <I.RotateCcw /> load a previous solve
+        </button>
       </div>
 
       <div
@@ -778,14 +1001,18 @@ function HomeScreen({
 // layer is a translateZ-offset plane, fed the solver's per-layer transparent silhouettes
 // (SolveResult.masks) so the sheets show through in depth like a real tunnel book.
 
-function BookVisualizer({ masks, sheetMasks }: { masks: string[]; sheetMasks?: string[] }) {
+function BookVisualizer({ masks, sheetMasks, defaultTex = "photo" }: {
+  masks: string[];
+  sheetMasks?: string[];
+  defaultTex?: "photo" | "sheet";
+}) {
   const [rotX, setRotX] = useState(16);
   const [rotY, setRotY] = useState(-26);
   const [scale, setScale] = useState(1);
   const [dragging, setDragging] = useState(false);
   const [hidden, setHidden] = useState<Set<number>>(new Set());
   // texture source: photo pixels vs the .ai-style fabrication sheet (paper/engrave/cut)
-  const [tex, setTex] = useState<"photo" | "sheet">("photo");
+  const [tex, setTex] = useState<"photo" | "sheet">(defaultTex);
   const hasSheet = !!sheetMasks && sheetMasks.length === masks.length;
   const planes = tex === "sheet" && hasSheet ? sheetMasks! : masks;
   const drag = useRef<{ x: number; y: number; rx: number; ry: number } | null>(null);
@@ -983,11 +1210,11 @@ function EdgeSelectionScreen({
   const [isPainting, setIsPainting] = useState(false);
   const [brushCursor, setBrushCursor] = useState<{ x: number; y: number } | null>(null);
   const [objective, setObjective] = useState<"depth" | "cut">("depth");
-  const [lambdaDepth, setLambdaDepth] = useState(0);
+  const [lambdaDepth, setLambdaDepth] = useState(0.5);
   const [connectivity, setConnectivity] = useState(true);
-  const [yMonotone, setYMonotone] = useState(false);
-  // solver knobs — defaults mirror the server's SolveRequest (norel_time=60, mip_focus=1, flow)
-  const [lazyConn, setLazyConn] = useState(false);
+  const [yMonotone, setYMonotone] = useState(true);
+  // solver knobs — defaults mirror the server's SolveRequest (norel_time=60, mip_focus=1, lazy)
+  const [lazyConn, setLazyConn] = useState(true);
   const [norelOn, setNorelOn] = useState(true);
   const [mipFocusOn, setMipFocusOn] = useState(true);
   // depth-plateau coherence tie-breaker — default OFF (mirrors SolveRequest); 0.05 is the
@@ -995,9 +1222,9 @@ function EdgeSelectionScreen({
   const [cohOn, setCohOn] = useState(false);
   const [lambdaCoh, setLambdaCoh] = useState(0.05);
   // per-layer visible-area floor — mirrors SolveRequest.min_layer_area (cut objective)
-  const [minLayerArea, setMinLayerArea] = useState(0.10);
-  // crease/cut score: laplacian (LoG across the boundary) vs meandiff (region-mean depth gap)
-  const [cutScore, setCutScore] = useState<CutScore>("laplacian");
+  const [minLayerArea, setMinLayerArea] = useState(0.04);
+  // crease/cut score: meandiff (region-mean depth gap) vs laplacian (LoG across the boundary)
+  const [cutScore, setCutScore] = useState<CutScore>("meandiff");
   const [logSigma, setLogSigma] = useState(2.0);
   // per-pixel positional region index decoded from regionMap (idx+1 in R + G<<8; 0 = none)
   const regionIdxRef = useRef<{ data: Uint8ClampedArray; w: number; h: number } | null>(null);
@@ -1873,6 +2100,8 @@ function EdgeSelectionScreen({
 
 function OutputScreen({
   imageFile,
+  loadedName,
+  loadedPreview,
   sessionId,
   numLayers,
   selectedEdgeCount,
@@ -1897,6 +2126,8 @@ function OutputScreen({
   onBack,
 }: {
   imageFile: File | null;
+  loadedName: string | null;
+  loadedPreview: string | null;
   sessionId: string | null;
   numLayers: number;
   selectedEdgeCount: number;
@@ -1925,7 +2156,62 @@ function OutputScreen({
   const [isExportingLayers, setIsExportingLayers] = useState(false);
   const [layersError, setLayersError] = useState<string | null>(null);
 
-  const baseName = imageFile ? imageFile.name.replace(/\.[^/.]+$/, "") : "output";
+  // Live engrave-density preview for the focused layer (paired with the per-layer sliders below).
+  const [focusedLayer, setFocusedLayer] = useState(0);
+  const [previewImg, setPreviewImg] = useState<string | null>(null);
+  const [previewStrokes, setPreviewStrokes] = useState<number | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewErr, setPreviewErr] = useState<string | null>(null);
+  const fLayer = Math.min(focusedLayer, Math.max(0, numLayers - 1));
+  const fFloor = minEngraveInPerLayer[fLayer] ?? 0.03;
+
+  useEffect(() => {
+    if (!sessionId || exportMode !== "engraving" || numLayers <= 0) {
+      setPreviewImg(null);
+      return;
+    }
+    let alive = true;
+    setPreviewLoading(true);
+    setPreviewErr(null);
+    // debounce so dragging the slider doesn't fire a render per pixel
+    const t = setTimeout(() => {
+      engravePreview(sessionId, fLayer, fFloor, frameWidthIn, exportMode)
+        .then((r) => { if (alive) { setPreviewImg(r.image); setPreviewStrokes(r.nStrokes); } })
+        .catch((e) => { if (alive) setPreviewErr(e?.message ?? "preview failed"); })
+        .finally(() => { if (alive) setPreviewLoading(false); });
+    }, 250);
+    return () => { alive = false; clearTimeout(t); };
+  }, [sessionId, fLayer, fFloor, frameWidthIn, exportMode, numLayers]);
+
+  // 3D stacked-book preview: all layers from the cached solve at the tuned per-layer densities.
+  // Heavier than the focused preview (N renders), so it settles ~500ms after the last change.
+  const [stackMasks, setStackMasks] = useState<string[]>([]);
+  const [stackSheet, setStackSheet] = useState<string[]>([]);
+  const [stackLoading, setStackLoading] = useState(false);
+  const [stackErr, setStackErr] = useState<string | null>(null);
+  const [stackNonce, setStackNonce] = useState(0);   // bump to force a refetch (e.g. after export)
+  const engraveKey = JSON.stringify(minEngraveInPerLayer);
+  const engraveOnKey = JSON.stringify(engraveLayers);
+
+  useEffect(() => {
+    if (!sessionId || numLayers <= 0) { setStackMasks([]); setStackSheet([]); return; }
+    let alive = true;
+    setStackLoading(true);
+    setStackErr(null);
+    const t = setTimeout(() => {
+      layerStack(sessionId, minEngraveInPerLayer, frameWidthIn, exportMode, engraveLayers)
+        .then((r) => { if (alive) { setStackMasks(r.masks); setStackSheet(r.sheetMasks); } })
+        .catch((e) => { if (alive) { setStackErr(e?.message ?? "3D preview failed"); setStackMasks([]); setStackSheet([]); } })
+        .finally(() => { if (alive) setStackLoading(false); });
+    }, 500);
+    return () => { alive = false; clearTimeout(t); };
+    // arrays are compared via their JSON keys below to avoid reference churn
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, numLayers, exportMode, frameWidthIn, engraveKey, engraveOnKey, stackNonce]);
+
+  const baseName = imageFile
+    ? imageFile.name.replace(/\.[^/.]+$/, "")
+    : (loadedName ?? "output");
   const safeBase = baseName.replace(/\s+/g, "_");
   const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
 
@@ -1969,6 +2255,7 @@ function OutputScreen({
           engraveLayers, minEngraveInPerLayer,
         ),
       );
+      setStackNonce((n) => n + 1);   // the export may have just created the cached solve
     } catch (err: any) {
       setLayersError(err?.message ?? "Layer export failed");
     } finally {
@@ -1988,8 +2275,25 @@ function OutputScreen({
         <div className="output-badge">{numLayers} layers</div>
       </div>
 
+      {loadedPreview && (
+        <div className="output-card" style={{ marginBottom: 12 }}>
+          <div className="output-card-header">// loaded solve — {loadedName}</div>
+          <div style={{ padding: "10px 16px 14px", display: "flex", gap: 14, alignItems: "flex-start" }}>
+            <img
+              src={loadedPreview}
+              alt="loaded layering"
+              style={{ width: 200, maxWidth: "40%", borderRadius: "var(--r-sm)", border: "1px solid var(--border-dim)" }}
+            />
+            <div style={{ fontSize: 12, color: "var(--text-dim)", lineHeight: 1.6 }}>
+              Reopened a previous solve. Change the export mode / frame and vary the per-layer
+              engrave density below, then export — the layering is fixed, nothing re-solves.
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="output-card">
-        <div className="output-card-header">// {imageFile?.name}</div>
+        <div className="output-card-header">// {imageFile?.name ?? loadedName}</div>
         <div className="output-row">
           <div className="output-row-left">
             <div className="output-dot" style={{ background: "#ef4444" }} />
@@ -2012,12 +2316,59 @@ function OutputScreen({
         <div className="output-card" style={{ marginTop: 12 }}>
           <div className="output-card-header">// per-layer engraving</div>
           <div style={{ padding: "8px 16px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+            {/* focused-layer live preview: exactly what the selected layer's density floor burns */}
+            <div style={{ display: "flex", gap: 12, alignItems: "flex-start", marginBottom: 6 }}>
+              <div style={{
+                position: "relative", width: 240, minHeight: 120, background: "var(--bg-main)",
+                borderRadius: "var(--r-sm)", border: "1px solid var(--border-dim)",
+                display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden",
+              }}>
+                {previewImg ? (
+                  <img
+                    src={previewImg}
+                    alt={`layer ${fLayer + 1} engrave preview`}
+                    style={{ width: "100%", display: "block", opacity: previewLoading ? 0.5 : 1 }}
+                  />
+                ) : (
+                  <span style={{ fontSize: 11, color: "var(--text-dim)", padding: 12, textAlign: "center" }}>
+                    {previewErr ?? (previewLoading ? "rendering…" : "preview")}
+                  </span>
+                )}
+                {previewLoading && previewImg && (
+                  <span style={{ position: "absolute", top: 6, right: 8, fontSize: 10, color: "var(--text-dim)" }}>
+                    updating…
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-dim)", lineHeight: 1.6 }}>
+                <div style={{ color: "var(--text-hi)", marginBottom: 2 }}>Layer {fLayer + 1} engrave</div>
+                detail floor {fFloor.toFixed(2)}″
+                {previewStrokes != null && <> · {previewStrokes} burn stroke{previewStrokes === 1 ? "" : "s"}</>}
+                <div style={{ marginTop: 6, fontSize: 11 }}>
+                  Click a layer to preview it; drag its slider to change density. Lower keeps finer
+                  texture, higher de-speckles — the preview shows what actually gets burned.
+                </div>
+              </div>
+            </div>
             {Array.from({ length: numLayers }).map((_, i) => {
               const on = engraveLayers[i] ?? true;
               const floor = minEngraveInPerLayer[i] ?? 0.03;
+              const focused = i === fLayer;
               return (
-                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12 }}>
-                  <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 90, cursor: "pointer" }}>
+                <div
+                  key={i}
+                  onClick={() => setFocusedLayer(i)}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 10, fontSize: 12,
+                    padding: "3px 6px", borderRadius: "var(--r-sm)", cursor: "pointer",
+                    background: focused ? "var(--bg-card)" : "transparent",
+                    outline: focused ? "1px solid var(--border-bright)" : "1px solid transparent",
+                  }}
+                >
+                  <label
+                    style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 90, cursor: "pointer" }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
                     <input
                       type="checkbox"
                       checked={on}
@@ -2036,6 +2387,7 @@ function OutputScreen({
                     step={0.01}
                     value={floor}
                     disabled={!on}
+                    onMouseDown={() => setFocusedLayer(i)}
                     onChange={(e) => {
                       const next = Array.from({ length: numLayers }, (_, k) => minEngraveInPerLayer[k] ?? 0.03);
                       next[i] = parseFloat(e.target.value);
@@ -2050,6 +2402,25 @@ function OutputScreen({
                 </div>
               );
             })}
+          </div>
+        </div>
+      )}
+
+      {numLayers > 0 && (
+        <div className="output-card" style={{ marginTop: 12 }}>
+          <div className="output-card-header">
+            // 3D preview{stackLoading ? " · updating…" : ""}
+          </div>
+          <div style={{ padding: "8px 12px 12px" }}>
+            {stackMasks.length > 0 ? (
+              <BookVisualizer masks={stackMasks} sheetMasks={stackSheet} defaultTex="sheet" />
+            ) : (
+              <div style={{ padding: 24, color: "var(--text-dim)", fontSize: 12, textAlign: "center" }}>
+                {stackErr
+                  ? "Export once (or load a run) to generate the 3D layering."
+                  : stackLoading ? "rendering 3D stack…" : "no layering yet"}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -2110,20 +2481,23 @@ function App() {
   const [selectedEdgeCount, setSelectedEdgeCount] = useState(0);
   const [markings, setMarkings] = useState<{ index: number; type: MarkType }[]>([]);
   const [objective, setObjective] = useState<"depth" | "cut">("depth");
-  const [lambdaDepth, setLambdaDepth] = useState(0);
+  const [lambdaDepth, setLambdaDepth] = useState(0.5);
   const [connectivity, setConnectivity] = useState(true);
-  const [yMonotone, setYMonotone] = useState(false);
-  const [connectivityMethod, setConnectivityMethod] = useState<ConnMethod>("flow");
+  const [yMonotone, setYMonotone] = useState(true);
+  const [connectivityMethod, setConnectivityMethod] = useState<ConnMethod>("lazy");
   const [norelTime, setNorelTime] = useState(60);
   const [mipFocus, setMipFocus] = useState(1);
   const [lambdaCoherence, setLambdaCoherence] = useState(0);
-  const [minLayerArea, setMinLayerArea] = useState(0.10);
-  const [cutScore, setCutScore] = useState<CutScore>("laplacian");
+  const [minLayerArea, setMinLayerArea] = useState(0.04);
+  const [cutScore, setCutScore] = useState<CutScore>("meandiff");
   const [regionMap, setRegionMap] = useState<string | null>(null);
   const [regionDepth, setRegionDepth] = useState<number[]>([]);
   // per-layer engrave overrides (sized to the layer count on solve); [] = use the global mode/floor
   const [engraveLayers, setEngraveLayers] = useState<boolean[]>([]);
   const [minEngraveInPerLayer, setMinEngraveInPerLayer] = useState<number[]>([]);
+  // set when a previous solve is loaded (no live imageFile): drives the export filename + a preview
+  const [loadedName, setLoadedName] = useState<string | null>(null);
+  const [loadedPreview, setLoadedPreview] = useState<string | null>(null);
 
   const reset = async () => {
     if (sessionId) await deleteSession(sessionId);
@@ -2143,6 +2517,45 @@ function App() {
     setFrameBorderIn(0.5);
     setEngraveLayers([]);
     setMinEngraveInPerLayer([]);
+    setLoadedName(null);
+    setLoadedPreview(null);
+    setImageFile(null);
+  };
+
+  const handleLoadRun = async (runId: string) => {
+    setBackendError(null);
+    setIsStarting(true);
+    try {
+      const d = await loadRun(runId);
+      const c = d.config;
+      setImageFile(null);
+      setSessionId(d.sessionId);
+      setSessionWidth(0);
+      setSessionHeight(0);
+      setTotalLayers(d.nLayers);
+      setObjective(c.objective);
+      setLambdaDepth(c.lambdaDepth);
+      setMinLayerArea(c.minLayerArea);
+      setCutScore(c.cutScore);
+      setConnectivity(c.connectivity);
+      setConnectivityMethod(c.connectivityMethod);
+      setYMonotone(c.yMonotone);
+      setNorelTime(c.norelTime);
+      setMipFocus(c.mipFocus);
+      setLambdaCoherence(c.lambdaCoherence);
+      setMarkings([]);
+      setSelectedEdgeCount(0);
+      setEngraveLayers(Array(d.nLayers).fill(true));
+      setMinEngraveInPerLayer(Array(d.nLayers).fill(0.03));
+      setExportMode("engraving");   // land with the per-layer density sliders visible
+      setLoadedName(d.runName ?? d.datasetSlug ?? "loaded run");
+      setLoadedPreview(d.overlay ?? null);
+      setScreen("output");
+    } catch (err: any) {
+      setBackendError(err?.message ?? "Failed to load run");
+    } finally {
+      setIsStarting(false);
+    }
   };
 
   const handleGo = async (
@@ -2224,6 +2637,7 @@ function App() {
           {screen === "home" && (
             <HomeScreen
               onGo={handleGo}
+              onLoadRun={handleLoadRun}
               isStarting={isStarting}
               error={backendError}
               exportMode={exportMode}
@@ -2248,6 +2662,8 @@ function App() {
           {screen === "output" && (
             <OutputScreen
               imageFile={imageFile}
+              loadedName={loadedName}
+              loadedPreview={loadedPreview}
               sessionId={sessionId}
               numLayers={totalLayers}
               selectedEdgeCount={selectedEdgeCount}
