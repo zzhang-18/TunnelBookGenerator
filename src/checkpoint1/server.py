@@ -68,6 +68,8 @@ from tunnelbook.export import build_layer_ai_docs
 from tunnelbook.export.ai import _detect_texture_edges, _trace_skeleton
 from tunnelbook.model import build_model
 from tunnelbook.solve import InfeasibleError, solve
+from tunnelbook.viz.layermap import render_layer_map
+from tunnelbook.viz.wood import render_front_view, wood_layer_stack
 
 app = FastAPI()
 _sessions: dict[str, dict] = {}
@@ -117,6 +119,7 @@ class SolveRequest(BaseModel):
     mip_focus: int = 1                # cut objective: Gurobi MIPFocus (1 = feasibility focus)
     cut_score: str = "meandiff"       # cut objective: "meandiff" (region-level depth gap) | "laplacian"
     cut_log_sigma: float = 2.0        # cut objective: LoG spatial scale (px) for the crease score
+    cut_sigma: float = 0.15           # cut objective: kappa drop-off width exp(-s^2/2sigma^2)
     lambda_coherence: float = 0.0     # cut objective: depth-plateau coherence tie-breaker (0 = off).
                                       # ON (0.05) fixes free plateau splits (robert-keane N=5:
                                       # mountain+sky unified, z spread, penalty paid ~0), but on
@@ -127,7 +130,7 @@ class SolveRequest(BaseModel):
 
 
 class ScoresRequest(BaseModel):
-    cut_score: str = "laplacian"
+    cut_score: str = "meandiff"
     cut_log_sigma: float = 2.0
 
 
@@ -220,20 +223,6 @@ def _overlay_img(inst, layers, rgb: np.ndarray) -> np.ndarray:
     norm = (lay - 1.0) / max(1, N - 1)
     color = (cm.viridis(np.nan_to_num(norm))[..., :3] * 255).astype(np.uint8)
     return (0.6 * color + 0.4 * rgb).astype(np.uint8)
-
-
-def _layer_imgs(inst, layer_of, rgb: np.ndarray) -> List[np.ndarray]:
-    """One image per layer (semantic view): that layer's regions in full colour, rest dimmed.
-    Used for the baseline preview, which has no solve -> no support to show."""
-    lay = inst.paint(np.asarray(layer_of, dtype=float))     # (H,W), 1..N per region
-    dim = (rgb * 0.18).astype(np.uint8)
-    out = []
-    for l in range(1, inst.n_layers + 1):
-        img = dim.copy()
-        m = lay == l
-        img[m] = rgb[m]
-        out.append(img)
-    return out
 
 
 def _layer_sheets(inst, sol, rgb: np.ndarray) -> List[np.ndarray]:
@@ -395,6 +384,16 @@ def _edges_payload(inst, scores=None, canny_align=None) -> List[dict]:
     return out
 
 
+def _display_scores(inst, depth, method: str, log_sigma: float) -> np.ndarray:
+    """Per-edge crease scores max-normalized for the UI heat ramp ONLY.  meandiff returns raw
+    |d_i - d_j| (max ~0.3 on real photos), which renders nearly dead against the [0,1] ramp;
+    dividing by the max lets the strongest edge hit 1.0 (a no-op for laplacian, which is already
+    min-max normalized).  Solver pricing is untouched: cut_costs re-derives the raw scores."""
+    scores = edge_depth_scores(inst, depth_map=depth, method=method, log_sigma=log_sigma)
+    smax = float(scores.max()) if scores.size else 0.0
+    return scores / smax if smax > 0 else scores
+
+
 def _build_cfg(req: "SolveRequest") -> Config:
     """Config for the requested objective.  ``"cut"`` drops the depth-fidelity term and lets the
     depth-aware boundary cut (plus the user's edge marks) drive the layering, with a per-layer
@@ -409,7 +408,7 @@ def _build_cfg(req: "SolveRequest") -> Config:
         return Config(n_layers=req.n_layers, fix_x=False,
                       depth_model="kmedian", lambda_depth=req.lambda_depth, lambda_support=0.0,
                       lambda_cut=req.lambda_cut, cut_cost="aware", cut_score=req.cut_score,
-                      cut_log_sigma=req.cut_log_sigma,
+                      cut_log_sigma=req.cut_log_sigma, cut_sigma=req.cut_sigma,
                       use_contact_weight=True,  # kappa_e scales with shared-boundary length
                       min_layer_area=req.min_layer_area,
                       min_layer_regions=req.min_layer_regions,
@@ -457,6 +456,7 @@ def _req_to_pipeline_params(req: "SolveRequest") -> PipelineParams:
             lambda_support=0.0, lambda_smooth=0.0,
             lambda_cut=req.lambda_cut, lambda_split=0.0,
             cut_cost="aware", cut_score=req.cut_score, cut_log_sigma=req.cut_log_sigma,
+            cut_sigma=req.cut_sigma,
             use_contact_weight=True,
             min_layer_area=req.min_layer_area, min_layer_regions=req.min_layer_regions,
             norel_time=req.norel_time, mip_focus=req.mip_focus,
@@ -498,9 +498,11 @@ def _solve_signature(req: "SolveRequest") -> tuple:
 
     Deliberately over exactly the solve-affecting fields the ``/export-ai`` payload also sends, so
     a solve and the export that follows it produce the *same* fingerprint.  Solve-only knobs the
-    export payload never carries (``lambda_split``, ``cut_log_sigma``, ``min_layer_regions``,
-    ``time_limit``, ``lambda_cut``) are excluded: on export they fall back to ``SolveRequest``
-    defaults, so including them would spuriously miss the cache and trigger a needless re-solve."""
+    export payload never carries (``lambda_split``, ``cut_log_sigma``, ``min_layer_regions``) are
+    excluded: on export they fall back to ``SolveRequest`` defaults, so including them would
+    spuriously miss the cache and trigger a needless re-solve.  ``time_limit`` is sent by both
+    payloads but stays excluded on purpose: it changes how long the search runs, not which
+    solution is sought, so an export should reuse the solve the user just watched."""
     marks = tuple(sorted((int(m.index), str(m.type)) for m in (req.markings or [])))
     def _r(x):
         return round(float(x), 6)
@@ -508,7 +510,8 @@ def _solve_signature(req: "SolveRequest") -> tuple:
         marks, int(req.n_layers), str(req.objective), _r(req.lambda_depth),
         bool(req.connectivity), str(req.connectivity_method), bool(req.y_monotone),
         _r(req.norel_time), int(req.mip_focus), _r(req.lambda_coherence),
-        _r(req.min_layer_area), str(req.cut_score),
+        _r(req.min_layer_area), str(req.cut_score), _r(req.lambda_cut),
+        _r(req.cut_sigma),
     )
 
 
@@ -648,8 +651,9 @@ async def create_session(
     except Exception as e:
         print(f"[sam] warm-up failed, will retry lazily on first click: {e}")
 
-    # depth-edge strength per boundary (LoG laplacian, normalized [0,1]) for the crease heatmap
-    scores = edge_depth_scores(inst, depth_map=depth, method="laplacian", log_sigma=2.0)
+    # depth-edge strength per boundary for the crease heatmap; meandiff matches the UI's default
+    # cut-score toggle, so the first render shows the same field the solver would price
+    scores = _display_scores(inst, depth, method="meandiff", log_sigma=2.0)
     # Visual edge strength per boundary: independent of depth, so a visually sharp silhouette
     # still reads as a real edge even where the depth estimate is too smooth/noisy to show a jump.
     # Uses continuous gradient magnitude (image_gradient_strength), not the binary Canny raster --
@@ -661,10 +665,9 @@ async def create_session(
                                            blur_sigma=_ep["blur_sigma"])
     canny_align = edge_gradient_strength(inst.label_map, inst.region_ids, gradient_map)
     edges = _edges_payload(inst, scores, canny_align)
-    # initial view = depth-binned layers, no solve -> instant upload; user solves on demand
-    lhat1 = inst.lhat + 1
-    baseline = _data_url(_png_bytes(_overlay_img(inst, lhat1, rgb)))
-    baseline_layers = [_data_url(_png_bytes(im)) for im in _layer_imgs(inst, lhat1, rgb)]
+    # initial view = the plain photo; the frontend draws the superpixel tessellation as SVG on
+    # top, so upload shows the segmentation only -- no solved-looking depth bins before a solve
+    baseline = _data_url(_png_bytes(rgb))
 
     # lossless per-pixel positional-region-index map (idx+1: R = low byte, G = high byte,
     # 0 = unmodeled pixel) so the frontend can hit-test regions under the cursor
@@ -680,7 +683,7 @@ async def create_session(
     return {
         "sessionId": session_id, "width": w, "height": h,
         "nLayers": n_layers, "nRegions": inst.n_regions,
-        "edges": edges, "baselineOverlay": baseline, "baselineLayers": baseline_layers,
+        "edges": edges, "baselineOverlay": baseline,
         "regionMap": region_map, "regionDepth": [float(v) for v in inst.mean_depth],
         "datasetSlug": d.name, "edgeConfigs": list_edge_configs(d),
     }
@@ -730,8 +733,8 @@ async def recompute_scores(session_id: str, req: ScoresRequest):
     sess = _sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Unknown session")
-    scores = edge_depth_scores(sess["inst"], depth_map=sess["depth"],
-                               method=req.cut_score, log_sigma=req.cut_log_sigma)
+    scores = _display_scores(sess["inst"], sess["depth"],
+                             method=req.cut_score, log_sigma=req.cut_log_sigma)
     return {"scores": [float(s) for s in scores]}
 
 
@@ -936,6 +939,77 @@ def layer_stack(session_id: str, req: LayerStackRequest):
             "sheetMasks": [_data_url(_png_bytes_rgba(m)) for m in sheet]}
 
 
+class ExportFrontViewRequest(BaseModel):
+    min_engrave_in_per_layer: Optional[List[float]] = None  # per-plane detail floor (in); None=0.03
+    engrave_layers: Optional[List[bool]] = None             # per-plane engrave on/off; None = all on
+    content_width_in: float = 12.0    # physical artwork width -> same in/px mapping as the .ai export
+    mode: str = "engraving"           # "engraving" | "outline" (outline = cut silhouettes, no burns)
+    backdrop: str = "wood"            # "wood" | "plain"
+    perspective: float = 0.037        # per-layer foreshortening step; 0 = flat front view
+    out_long_px: int = 1500           # supersample target for the long edge
+
+
+@app.post("/api/sessions/{session_id}/export-front-view")
+def export_front_view(session_id: str, req: ExportFrontViewRequest):
+    """Zip of the stacked plywood front view (front_view.png) + each layer's wood sheet
+    (wood_layer_NN.png, RGBA, front first), rendered from the cached solution at the given
+    per-layer engrave densities -- no solving.  Same sheets examples/render_front_view.py writes."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown session")
+    sol = sess.get("sol")
+    if sol is None:
+        raise HTTPException(status_code=409, detail="No solution yet -- solve or load a run first")
+    n_layers = sol.inst.n_layers
+    for name, arr in (("engrave_layers", req.engrave_layers),
+                      ("min_engrave_in_per_layer", req.min_engrave_in_per_layer)):
+        if arr is not None and len(arr) != n_layers:
+            raise HTTPException(status_code=400,
+                                detail=f"{name} must have length {n_layers}, got {len(arr)}")
+    try:
+        layers = wood_layer_stack(sol.inst, sol, sess["rgb"],
+                                  content_width_in=req.content_width_in,
+                                  min_engrave_in_per_layer=req.min_engrave_in_per_layer,
+                                  engrave=(req.mode == "engraving"),
+                                  engrave_layers=req.engrave_layers,
+                                  out_long_px=req.out_long_px)
+        fv = render_front_view(layers, backdrop=req.backdrop, perspective=req.perspective)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Front view render failed: {e}")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("front_view.png", _png_bytes(fv))
+        for i, layer in enumerate(layers, 1):     # 1-indexed, as examples/render_front_view.py
+            zf.writestr(f"wood_layer_{i:02d}.png", _png_bytes_rgba(layer))
+    base = re.sub(r"[^\x00-\x7F]+", "_", sess["filename"].rsplit(".", 1)[0])
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{base}_front_view.zip"'})
+
+
+class ExportLayerMapRequest(BaseModel):
+    out_long_px: int = 2000    # supersample target for the long edge
+
+
+@app.post("/api/sessions/{session_id}/export-layer-map")
+def export_layer_map(session_id: str, req: ExportLayerMapRequest):
+    """High-res layer-assignment map PNG from the cached solution -- no solving.  Stretched
+    viridis (front = dark purple, back = yellow, like the gallery fig) over the grayscale photo,
+    with a numbered-squares legend (tunnelbook.viz.layermap)."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Unknown session")
+    sol = sess.get("sol")
+    if sol is None:
+        raise HTTPException(status_code=409, detail="No solution yet -- solve or load a run first")
+    try:
+        img = render_layer_map(sol.inst, sol, sess["rgb"], out_long_px=req.out_long_px)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Layer map render failed: {e}")
+    base = re.sub(r"[^\x00-\x7F]+", "_", sess["filename"].rsplit(".", 1)[0])
+    return Response(content=_png_bytes(img), media_type="image/png",
+                    headers={"Content-Disposition": f'attachment; filename="{base}_layer_map.png"'})
+
+
 # ── load a previous solve (re-export at new settings without re-solving) ─────────
 #
 # Every solve -- a UI run (RUNS_DIR) or a cluster sweep (image_outputs/) -- persists a full
@@ -988,6 +1062,28 @@ def _decode_run_id(run_id: str) -> str:
     if not os.path.isfile(os.path.join(cand, "result.npz")):
         raise HTTPException(status_code=404, detail="run has no result.npz")
     return cand
+
+
+def _resolve_run_path(path: str) -> str:
+    """User-typed run path -> validated absolute run dir (must contain result.npz).
+
+    Accepts the run dir itself or its result.npz; absolute, ``~``-relative, or relative to the
+    repo root (the dir holding datasets/ -- same anchor as ``_run_roots``) or the CWD.  Unlike
+    run ids this deliberately allows arbitrary absolute paths: it is the escape hatch for runs
+    beyond the listing cap on a local dev tool; result.npz presence is the gate."""
+    p = os.path.expanduser(path.strip())
+    cands = [p] if os.path.isabs(p) else [
+        os.path.join(os.path.dirname(str(datasets_root())), p),   # repo root, as _run_roots
+        os.path.abspath(p),                                       # CWD fallback
+    ]
+    for cand in cands:
+        cand = os.path.realpath(cand)
+        if os.path.basename(cand) == "result.npz":
+            cand = os.path.dirname(cand)
+        if os.path.isfile(os.path.join(cand, "result.npz")):
+            return cand
+    raise HTTPException(status_code=404,
+                        detail=f"no result.npz found for {path!r} (tried: {', '.join(cands)})")
 
 
 def _run_display_config(cfg: dict) -> dict:
@@ -1071,12 +1167,14 @@ def list_runs(limit: int = 40, thumbs: bool = True):
             if len(found) >= 4000:
                 break
     found.sort(key=lambda t: t[0], reverse=True)
-    found = found[:max(1, min(int(limit), 200))]
+    cap = 200 if thumbs else 1000     # thumbs (per-run JPEG encode) are the expensive part
+    found = found[:max(1, min(int(limit), cap))]
     return {"runs": [_run_meta(d, ri, root, label, thumbs) for _mt, ri, label, root, d in found]}
 
 
 class LoadRunRequest(BaseModel):
-    runId: str
+    runId: Optional[str] = None   # id from /api/runs
+    path: Optional[str] = None    # direct run-dir (or result.npz) path; absolute or repo-relative
 
 
 @app.post("/api/load-run")
@@ -1084,7 +1182,9 @@ def load_run(req: LoadRunRequest):
     """Hydrate a fresh session from a saved run's result.npz (+ its dataset photo) and return the
     solved layering + its config.  Export then reuses this solution -- change the per-layer engrave
     density and re-export with no solve.  (Changing a *solve* param would re-solve, as usual.)"""
-    run_dir = _decode_run_id(req.runId)
+    if bool(req.runId) == bool(req.path):
+        raise HTTPException(status_code=400, detail="provide exactly one of runId or path")
+    run_dir = _decode_run_id(req.runId) if req.runId else _resolve_run_path(req.path)
     try:
         cfg = json.loads((Path(run_dir) / "config.json").read_text())
     except Exception:

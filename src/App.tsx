@@ -250,6 +250,9 @@ async function solveSession(
   lambdaCoherence: number,
   minLayerArea: number,
   cutScore: CutScore,
+  timeLimit: number,
+  lambdaCut: number,
+  cutSigma: number,
 ): Promise<SolveResult> {
   const res = await fetch(apiUrl(`/api/sessions/${sessionId}/solve`), {
     method: "POST",
@@ -260,7 +263,8 @@ async function solveSession(
       connectivity, y_monotone: yMonotone,
       connectivity_method: connectivityMethod, norel_time: norelTime, mip_focus: mipFocus,
       lambda_coherence: lambdaCoherence, min_layer_area: minLayerArea,
-      cut_score: cutScore,
+      cut_score: cutScore, time_limit: timeLimit, lambda_cut: lambdaCut,
+      cut_sigma: cutSigma,
     }),
   });
   if (!res.ok)
@@ -371,8 +375,8 @@ interface RunItem {
   thumb?: string | null;
 }
 
-async function listRuns(limit = 40): Promise<RunItem[]> {
-  const res = await fetch(apiUrl(`/api/runs?limit=${limit}`));
+async function listRuns(limit = 40, thumbs = true): Promise<RunItem[]> {
+  const res = await fetch(apiUrl(`/api/runs?limit=${limit}&thumbs=${thumbs}`));
   if (!res.ok)
     throw new Error(
       (await res.text().catch(() => "")) || `List runs failed (${res.status})`,
@@ -405,16 +409,18 @@ interface LoadRunResult {
   };
 }
 
-async function loadRun(runId: string): Promise<LoadRunResult> {
+async function loadRun(src: { runId?: string; path?: string }): Promise<LoadRunResult> {
   const res = await fetch(apiUrl(`/api/load-run`), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ runId }),
+    body: JSON.stringify(src),
   });
-  if (!res.ok)
-    throw new Error(
-      (await res.text().catch(() => "")) || `Load run failed (${res.status})`,
-    );
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    let msg = txt || `Load run failed (${res.status})`;
+    try { msg = JSON.parse(txt).detail ?? msg; } catch { /* not JSON */ }
+    throw new Error(msg);
+  }
   return res.json();
 }
 
@@ -481,6 +487,9 @@ async function exportLayers(
   lambdaCoherence: number,
   minLayerArea: number,
   cutScore: CutScore,
+  timeLimit: number,
+  lambdaCut: number,
+  cutSigma: number,
   mode: ExportMode,
   contentWidthIn: number,
   borderIn: number,
@@ -495,7 +504,8 @@ async function exportLayers(
       connectivity, y_monotone: yMonotone,
       connectivity_method: connectivityMethod, norel_time: norelTime, mip_focus: mipFocus,
       lambda_coherence: lambdaCoherence, min_layer_area: minLayerArea,
-      cut_score: cutScore,
+      cut_score: cutScore, time_limit: timeLimit, lambda_cut: lambdaCut,
+      cut_sigma: cutSigma,
       mode, content_width_in: contentWidthIn, border_in: borderIn,
       // per-layer engrave overrides (omit when engraving is off / arrays not sized yet)
       engrave_layers: mode === "engraving" && engraveLayers.length === nLayers
@@ -511,6 +521,51 @@ async function exportLayers(
   return res.blob();
 }
 
+// Stacked plywood front view + each layer's wood sheet from the cached solve (no re-solving),
+// rendered at the same per-layer densities / floors the .ai export burns.
+async function exportFrontView(
+  sessionId: string,
+  nLayers: number,
+  minEngraveInPerLayer: number[],
+  engraveLayers: boolean[],
+  contentWidthIn: number,
+  mode: ExportMode,
+): Promise<Blob> {
+  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/export-front-view`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      min_engrave_in_per_layer:
+        mode === "engraving" && minEngraveInPerLayer.length === nLayers
+          ? minEngraveInPerLayer : null,
+      engrave_layers:
+        mode === "engraving" && engraveLayers.length === nLayers ? engraveLayers : null,
+      content_width_in: contentWidthIn,
+      mode,
+    }),
+  });
+  if (!res.ok)
+    throw new Error(
+      (await res.text().catch(() => "")) || `Front view export failed (${res.status})`,
+    );
+  return res.blob();
+}
+
+// High-res layer-assignment map (stretched viridis over the grayscale photo, numbered legend)
+// from the cached solve -- no re-solving, no export settings involved.
+async function exportLayerMap(sessionId: string): Promise<Blob> {
+  const res = await fetch(apiUrl(`/api/sessions/${sessionId}/export-layer-map`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!res.ok)
+    throw new Error(
+      (await res.text().catch(() => "")) || `Layer map export failed (${res.status})`,
+    );
+  return res.blob();
+}
+
 // ─── Shared UI primitives ─────────────────────────────────────────────────────
 
 function HelpModal({ onClose }: { onClose: () => void }) {
@@ -521,25 +576,26 @@ function HelpModal({ onClose }: { onClose: () => void }) {
         <div className="modal-title"><I.Sparkles /> How It Works</div>
         <div className="modal-step">
           <div className="modal-step-label"><I.Upload /> step 1 — Upload</div>
-          <p>Drop or click to upload a photo. Enter how many layers (1–10) and press <strong>run</strong>. Edge detection runs automatically.</p>
+          <p>Drop or click to upload a photo, pick the layer count and frame size, and press <strong>run</strong>. Superpixel segmentation and depth estimation run automatically; the photo appears with its region boundaries drawn on top.</p>
         </div>
         <hr className="modal-divider" />
         <div className="modal-step">
-          <div className="modal-step-label"><I.Brush /> step 2 — Select Edges</div>
+          <div className="modal-step-label"><I.Brush /> step 2 — Mark Boundaries</div>
           <p>
-            All detected boundaries are shown as white lines. Click any edge to mark it as a <strong>cut line</strong> (turns red). Click again to deselect.
-            Use <strong>select all</strong> / <strong>clear all</strong> for bulk actions.
+            Click or brush boundaries to mark <strong>soft splits</strong>, <strong>hard splits</strong>, or <strong>deletes</strong>; click a region to outline a whole object.
+            <strong> auto select</strong> ranks boundaries for you, and the <strong>crease map</strong> shows where the solver finds cuts cheap.
+            <strong> advanced</strong> reveals the objective (cut / depth fit) and solver knobs.
           </p>
         </div>
         <hr className="modal-divider" />
         <div className="modal-step">
-          <div className="modal-step-label"><I.CheckCircle /> step 3 — Confirm</div>
-          <p>Press <strong>confirm cuts</strong> to store your selection. The backend will use these edges together with depth estimation to assign pixels to layers.</p>
+          <div className="modal-step-label"><I.CheckCircle /> step 3 — Solve &amp; Preview</div>
+          <p>Press <strong>solve / preview</strong> to assign regions to layers (the overlay and 3D stack update), then <strong>export →</strong> when the layering looks right.</p>
         </div>
         <hr className="modal-divider" />
         <div className="modal-step">
           <div className="modal-step-label"><I.Download /> step 4 — Export</div>
-          <p><strong>Export Stand</strong> gives an Adobe Illustrator file for the laser-cut tunnel book stand.</p>
+          <p><strong>Download layers</strong> gives a zip of per-layer Adobe Illustrator cut files (outline or engraving mode, with per-layer engrave density); <strong>Export Stand</strong> gives the laser-cut stand.</p>
         </div>
       </div>
     </div>
@@ -609,23 +665,54 @@ function Sidebar({
 // ─── Home Screen ──────────────────────────────────────────────────────────────
 
 // ─── Load-a-previous-solve picker ─────────────────────────────────────────────
-// Lists saved solves (UI runs + cluster sweeps) and reopens one so its export settings /
-// per-layer engrave density can be changed and re-exported with no re-solving.
+// Compact searchable list of saved solves (UI runs + cluster sweeps) plus a direct-path box
+// (for runs beyond the listing cap); reopening one lets its export settings / per-layer engrave
+// density be changed and re-exported with no re-solving.  onPick resolves to null on success
+// (the screen switch unmounts the modal) or an error message to show inline.
 function LoadRunModal({ onPick, onClose }: {
-  onPick: (id: string) => void;
+  onPick: (src: { runId?: string; path?: string }) => Promise<string | null>;
   onClose: () => void;
 }) {
   const [runs, setRuns] = useState<RunItem[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
+  const [q, setQ] = useState("");
+  const [path, setPath] = useState("");
+  const [busyPath, setBusyPath] = useState(false);
 
   useEffect(() => {
     let alive = true;
-    listRuns(60)
+    listRuns(500, false)   // compact rows need no thumbs; without them the higher cap is cheap
       .then((r) => { if (alive) setRuns(r); })
       .catch((e) => { if (alive) setErr(e?.message ?? "Failed to list runs"); });
     return () => { alive = false; };
   }, []);
+
+  const busy = !!loadingId || busyPath;
+  const submitPath = async () => {
+    const p = path.trim();
+    if (!p || busy) return;
+    setErr(null);
+    setBusyPath(true);
+    const msg = await onPick({ path: p });
+    if (msg) { setErr(msg); setBusyPath(false); }
+  };
+  const pickRun = async (id: string) => {
+    if (busy) return;
+    setErr(null);
+    setLoadingId(id);
+    const msg = await onPick({ runId: id });
+    if (msg) { setErr(msg); setLoadingId(null); }
+  };
+
+  const needle = q.trim().toLowerCase();
+  const filtered = (runs ?? []).filter(
+    (r) => `${r.name} ${r.slug ?? ""} ${r.source}`.toLowerCase().includes(needle),
+  );
+  const inputStyle: React.CSSProperties = {
+    fontSize: 11.5, padding: "6px 8px", border: "1px solid var(--border-dim)",
+    borderRadius: "var(--r-sm)", background: "var(--bg-main)", color: "var(--text-hi)",
+  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -638,58 +725,91 @@ function LoadRunModal({ onPick, onClose }: {
         <div className="modal-title"><I.RotateCcw /> Load a previous solve</div>
         <p style={{ color: "var(--text-dim)", fontSize: 12, margin: "0 0 12px" }}>
           Reopen a saved layering to change export settings and vary per-layer engrave density —
-          nothing re-solves.
+          nothing re-solves. Pick a run below, or paste a run dir (or its result.npz) path.
         </p>
+        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+          <input
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") submitPath(); }}
+            placeholder="/abs/or/repo-relative/run-dir — or its result.npz"
+            disabled={busy}
+            spellCheck={false}
+            style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }}
+          />
+          <button
+            onClick={submitPath}
+            disabled={busy || !path.trim()}
+            style={{
+              fontSize: 11.5, padding: "6px 12px", border: "1px solid var(--border-dim)",
+              borderRadius: "var(--r-sm)", background: "var(--bg-card)", color: "var(--text-hi)",
+              cursor: busy || !path.trim() ? "default" : "pointer", whiteSpace: "nowrap",
+            }}
+          >
+            {busyPath ? "Loading…" : "Load path"}
+          </button>
+        </div>
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="filter by name / slug / source…"
+          spellCheck={false}
+          style={{ ...inputStyle, marginBottom: 8 }}
+        />
         {err && <div style={{ color: "var(--coral)", fontSize: 12, padding: 8 }}>{err}</div>}
         {!runs && !err && (
           <div style={{ padding: 20, color: "var(--text-dim)" }}>Loading runs…</div>
         )}
-        {runs && runs.length === 0 && (
-          <div style={{ padding: 20, color: "var(--text-dim)" }}>No saved runs found.</div>
+        {runs && filtered.length === 0 && (
+          <div style={{ padding: 20, color: "var(--text-dim)" }}>
+            {runs.length === 0 ? "No saved runs found." : "No runs match the filter."}
+          </div>
         )}
-        {runs && runs.length > 0 && (
-          <div
-            style={{
-              overflowY: "auto", display: "grid",
-              gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: 10, paddingRight: 4,
-            }}
-          >
-            {runs.map((r) => (
+        {runs && filtered.length > 0 && (
+          <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, paddingRight: 4 }}>
+            {filtered.map((r) => (
               <button
                 key={r.id}
-                disabled={!!loadingId}
-                onClick={() => { setLoadingId(r.id); onPick(r.id); }}
+                disabled={busy}
+                onClick={() => pickRun(r.id)}
                 title={r.name}
                 style={{
                   textAlign: "left", border: "1px solid var(--border-dim)",
-                  borderRadius: "var(--r-md)", background: "var(--bg-card)", padding: 8,
-                  cursor: loadingId ? "wait" : "pointer",
-                  opacity: loadingId && loadingId !== r.id ? 0.45 : 1,
+                  borderRadius: "var(--r-sm)", background: "var(--bg-card)", padding: "6px 10px",
+                  cursor: busy ? "wait" : "pointer",
+                  opacity: busy && loadingId !== r.id ? 0.45 : 1,
+                  display: "flex", alignItems: "baseline", gap: 10, minWidth: 0,
                 }}
               >
-                {r.thumb ? (
-                  <img
-                    src={r.thumb} alt={r.name}
-                    style={{ width: "100%", borderRadius: "var(--r-sm)", display: "block" }}
-                  />
-                ) : (
-                  <div style={{ height: 88, background: "var(--bg-main)", borderRadius: "var(--r-sm)" }} />
-                )}
-                <div style={{ fontSize: 11, marginTop: 6, color: "var(--text-hi)", wordBreak: "break-word" }}>
-                  {loadingId === r.id ? "loading…" : (r.slug ?? r.name)}
-                </div>
-                <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 3 }}>
-                  {r.nLayers} layers · {r.objective}
-                  {r.objective === "cut" ? ` · ${r.cutScore} · λd ${r.lambdaDepth}` : ""}
-                </div>
-                <div style={{
-                  fontSize: 9.5, color: "var(--text-lo)", marginTop: 2,
-                  display: "flex", justifyContent: "space-between",
+                <span style={{
+                  fontSize: 12, color: "var(--text-hi)",
+                  whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
                 }}>
-                  <span>{r.status ?? ""}</span><span>{r.source}</span>
-                </div>
+                  {loadingId === r.id ? "loading…" : r.name}
+                </span>
+                {r.slug && r.slug !== r.name && (
+                  <span style={{
+                    fontSize: 10.5, color: "var(--text-dim)",
+                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                  }}>
+                    {r.slug}
+                  </span>
+                )}
+                <span style={{
+                  marginLeft: "auto", fontSize: 10.5, color: "var(--text-dim)",
+                  whiteSpace: "nowrap", flexShrink: 0,
+                }}>
+                  {r.source} · {r.nLayers}L · {r.objective}
+                  {r.objective === "cut" ? ` · λd ${r.lambdaDepth}` : ""}
+                  {" · "}{new Date(r.mtime * 1000).toLocaleDateString()}
+                </span>
               </button>
             ))}
+          </div>
+        )}
+        {runs && (
+          <div style={{ fontSize: 10, color: "var(--text-lo)", marginTop: 6 }}>
+            {filtered.length} of {runs.length} runs
           </div>
         )}
       </div>
@@ -710,7 +830,7 @@ function HomeScreen({
     frameWidthIn: number, frameHeightIn: number, frameBorderIn: number,
     edgeCondition: boolean,
   ) => void;
-  onLoadRun: (runId: string) => void;
+  onLoadRun: (src: { runId?: string; path?: string }) => Promise<string | null>;
   isStarting: boolean;
   error: string | null;
   exportMode: ExportMode;
@@ -787,7 +907,7 @@ function HomeScreen({
 
       {showLoad && (
         <LoadRunModal
-          onPick={(id) => { setShowLoad(false); onLoadRun(id); }}
+          onPick={onLoadRun}
           onClose={() => setShowLoad(false)}
         />
       )}
@@ -902,9 +1022,6 @@ function HomeScreen({
           />
           <I.Brush size={12} /> condition boundaries on detected edges
         </label>
-        <span style={{ fontSize: 11, color: "var(--text-dim)", marginLeft: 22 }}>
-          splits superpixels along real Canny object edges, not just the segmentation tessellation
-        </span>
       </div>
 
       {/* ── Row 2: frame dimensions ── */}
@@ -1198,6 +1315,9 @@ function EdgeSelectionScreen({
     lambdaCoherence: number,
     minLayerArea: number,
     cutScore: CutScore,
+    timeLimit: number,
+    lambdaCut: number,
+    cutSigma: number,
   ) => void;
   onBack: () => void;
 }) {
@@ -1209,7 +1329,7 @@ function EdgeSelectionScreen({
   const [brushSize, setBrushSize] = useState(20);
   const [isPainting, setIsPainting] = useState(false);
   const [brushCursor, setBrushCursor] = useState<{ x: number; y: number } | null>(null);
-  const [objective, setObjective] = useState<"depth" | "cut">("depth");
+  const [objective, setObjective] = useState<"depth" | "cut">("cut");
   const [lambdaDepth, setLambdaDepth] = useState(0.5);
   const [connectivity, setConnectivity] = useState(true);
   const [yMonotone, setYMonotone] = useState(true);
@@ -1223,9 +1343,15 @@ function EdgeSelectionScreen({
   const [lambdaCoh, setLambdaCoh] = useState(0.05);
   // per-layer visible-area floor — mirrors SolveRequest.min_layer_area (cut objective)
   const [minLayerArea, setMinLayerArea] = useState(0.04);
+  // boundary-cut term on/off (lambda_cut 1|0) — off ablates to pure k-median depth + area floor
+  const [cutLossOn, setCutLossOn] = useState(true);
+  // kappa drop-off width: cut cost = base * exp(-s^2/2sigma^2); smaller = sharper drop-off
+  const [cutSigma, setCutSigma] = useState(0.15);
   // crease/cut score: meandiff (region-mean depth gap) vs laplacian (LoG across the boundary)
   const [cutScore, setCutScore] = useState<CutScore>("meandiff");
   const [logSigma, setLogSigma] = useState(2.0);
+  // Gurobi wall-clock budget per solve -- mirrors SolveRequest.time_limit
+  const [timeLimit, setTimeLimit] = useState(180);
   // per-pixel positional region index decoded from regionMap (idx+1 in R + G<<8; 0 = none)
   const regionIdxRef = useRef<{ data: Uint8ClampedArray; w: number; h: number } | null>(null);
   const [hoverRegion, setHoverRegion] = useState<{ idx: number; px: number; py: number; w: number; h: number } | null>(null);
@@ -1244,7 +1370,7 @@ function EdgeSelectionScreen({
   // point-prompted SAM "select object": click the photo (not an edge) to mark its outline
   const [objectSelectMode, setObjectSelectMode] = useState(false);
   // "advanced" accordion: objective + connectivity + cut-tuning/solver knobs, collapsed by
-  // default -- most sessions never need to leave depth-fit + default solver settings
+  // default -- most sessions never need to leave the cut objective + default solver settings
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [isSelectingObject, setIsSelectingObject] = useState(false);
   const [selectObjectError, setSelectObjectError] = useState<string | null>(null);
@@ -1484,12 +1610,13 @@ function EdgeSelectionScreen({
   const norelTime = norelOn ? 60 : 0;
   const mipFocus = mipFocusOn ? 1 : 0;
   const lambdaCoherence = cohOn ? lambdaCoh : 0;
+  const lambdaCut = cutLossOn ? 1.0 : 0.0;
 
   const handleSolve = async () => {
     setIsSolving(true);
     setSolveError(null);
     try {
-      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea, cutScore);
+      const r = await solveSession(sessionId, markingsArray(), numLayers, 1.0, objective, logSigma, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea, cutScore, timeLimit, lambdaCut, cutSigma);
       setOverlay(r.overlay);
       setResult(r);
     } catch (err: any) {
@@ -1656,7 +1783,7 @@ function EdgeSelectionScreen({
                 className="ctrl-btn"
                 onClick={() => setObjective(o.key)}
                 title={o.key === "cut"
-                  ? "depth-aware boundary cut only (>=5 spx/layer); your edge marks drive the splits"
+                  ? "depth-aware boundary cut only (each layer must own >=4% of the image by default); your edge marks drive the splits"
                   : "fixed depth-bin fidelity (baseline)"}
                 style={{
                   borderColor: objective === o.key ? "var(--ink)" : "transparent",
@@ -1735,6 +1862,29 @@ function EdgeSelectionScreen({
             <div className="canvas-tools-row">
               <span className="canvas-tools-hint" style={{ marginRight: 4 }}>advanced · cut tuning:</span>
               <label
+                title="Boundary-cut term (lambda_cut=1): prices each cut edge by the crease field, so cuts land where depth already jumps and soft marks read as free. Off (lambda_cut=0) ablates it — the k-median depth anchor + area floor drive the layering alone, and soft marks stop mattering (hard splits / deletes still apply)"
+                style={{ fontSize: 11, color: "var(--text-dim)" }}
+              >
+                <input
+                  type="checkbox" checked={cutLossOn}
+                  onChange={(ev) => setCutLossOn(ev.target.checked)}
+                />
+                cut loss
+              </label>
+              {cutLossOn && (
+                <label
+                  title="Kappa drop-off width: cut cost falls as exp(-s^2/2sigma^2) with the boundary's depth gap s. Smaller sigma = sharper — boundaries with even modest depth gaps become nearly free to cut, so depth-outlier regions detach more easily (0.15 default; at 0.05 a 0.1 depth gap already cuts at ~14% cost)"
+                  style={{ fontSize: 11, color: "var(--text-dim)" }}
+                >
+                  cut σ {cutSigma.toFixed(2)}
+                  <input
+                    type="range" min={0.03} max={0.3} step={0.01} value={cutSigma}
+                    onChange={(ev) => setCutSigma(Number(ev.target.value))}
+                    style={{ width: 80 }}
+                  />
+                </label>
+              )}
+              <label
                 title="k-median depth anchor: 0 = pure cut (your marks drive everything); above ~0.5 depth dominates and marks stop mattering"
                 style={{ fontSize: 11, color: "var(--text-dim)" }}
               >
@@ -1781,33 +1931,47 @@ function EdgeSelectionScreen({
               )}
             </div>
           )}
-          {/* advanced: Gurobi search-strategy hints (cut objective only) -- split from the cut-
-              tuning row above so neither is long enough to wrap unpredictably */}
-          {objective === "cut" && (
-            <div className="canvas-tools-row">
-              <span className="canvas-tools-hint" style={{ marginRight: 4 }}>advanced · solver:</span>
-              <label
-                title="Gurobi NoRelHeurTime=60: spend the first 60s in the no-relaxation heuristic. Rescues incumbents on N>=4 cut solves where the LP bound is useless (cut objective only)"
-                style={{ fontSize: 11, color: "var(--text-dim)" }}
-              >
-                <input
-                  type="checkbox" checked={norelOn}
-                  onChange={(ev) => setNorelOn(ev.target.checked)}
-                />
-                norel 60s
-              </label>
-              <label
-                title="Gurobi MIPFocus=1: bias the search toward finding feasible solutions over proving bounds (cut objective only)"
-                style={{ fontSize: 11, color: "var(--text-dim)" }}
-              >
-                <input
-                  type="checkbox" checked={mipFocusOn}
-                  onChange={(ev) => setMipFocusOn(ev.target.checked)}
-                />
-                mip focus
-              </label>
-            </div>
-          )}
+          {/* advanced: solver time budget (either objective) + Gurobi search-strategy hints
+              (cut objective only) -- split from the cut-tuning row above so neither is long
+              enough to wrap unpredictably */}
+          <div className="canvas-tools-row">
+            <span className="canvas-tools-hint" style={{ marginRight: 4 }}>advanced · solver:</span>
+            <label
+              title="Gurobi TimeLimit: max seconds per solve; the solver returns its best incumbent when time runs out (either objective)"
+              style={{ fontSize: 11, color: "var(--text-dim)" }}
+            >
+              time limit {timeLimit}s
+              <input
+                type="range" min={10} max={180} step={10} value={timeLimit}
+                onChange={(ev) => setTimeLimit(Number(ev.target.value))}
+                style={{ width: 90 }}
+              />
+            </label>
+            {objective === "cut" && (
+              <>
+                <label
+                  title="Gurobi NoRelHeurTime=60: spend the first 60s in the no-relaxation heuristic. Rescues incumbents on N>=4 cut solves where the LP bound is useless (cut objective only)"
+                  style={{ fontSize: 11, color: "var(--text-dim)" }}
+                >
+                  <input
+                    type="checkbox" checked={norelOn}
+                    onChange={(ev) => setNorelOn(ev.target.checked)}
+                  />
+                  norel 60s
+                </label>
+                <label
+                  title="Gurobi MIPFocus=1: bias the search toward finding feasible solutions over proving bounds (cut objective only)"
+                  style={{ fontSize: 11, color: "var(--text-dim)" }}
+                >
+                  <input
+                    type="checkbox" checked={mipFocusOn}
+                    onChange={(ev) => setMipFocusOn(ev.target.checked)}
+                  />
+                  mip focus
+                </label>
+              </>
+            )}
+          </div>
           </>
           )}
         </div>
@@ -1988,14 +2152,17 @@ function EdgeSelectionScreen({
             </span>
           </div>
           <div className="canvas-tools-row">
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)" }}>
-              LoG σ {logSigma.toFixed(1)}px
-              <input
-                type="range" min={0.5} max={8} step={0.5} value={logSigma}
-                onChange={(ev) => setLogSigma(Number(ev.target.value))}
-                style={{ width: 110 }}
-              />
-            </label>
+            {/* LoG σ only shapes the laplacian score; meandiff ignores it, so hide the slider */}
+            {cutScore === "laplacian" && (
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-dim)" }}>
+                LoG σ {logSigma.toFixed(1)}px
+                <input
+                  type="range" min={0.5} max={8} step={0.5} value={logSigma}
+                  onChange={(ev) => setLogSigma(Number(ev.target.value))}
+                  style={{ width: 110 }}
+                />
+              </label>
+            )}
             <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "var(--text-dim)", marginLeft: "auto" }}>
               <span>costly to cut</span>
               <span style={{
@@ -2079,7 +2246,7 @@ function EdgeSelectionScreen({
           {solveError && <span className="seg-error-inline">// {solveError}</span>}
           <button
             className="ctrl-btn ctrl-btn--ghost"
-            onClick={() => onSubmit(markingsArray(), objective, markCount, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea, cutScore)}
+            onClick={() => onSubmit(markingsArray(), objective, markCount, lambdaDepth, connectivity, yMonotone, connMethod, norelTime, mipFocus, lambdaCoherence, minLayerArea, cutScore, timeLimit, lambdaCut, cutSigma)}
           >
             export →
           </button>
@@ -2116,6 +2283,9 @@ function OutputScreen({
   lambdaCoherence,
   minLayerArea,
   cutScore,
+  timeLimit,
+  lambdaCut,
+  cutSigma,
   exportMode,
   frameWidthIn,
   frameBorderIn,
@@ -2142,6 +2312,9 @@ function OutputScreen({
   lambdaCoherence: number;
   minLayerArea: number;
   cutScore: CutScore;
+  timeLimit: number;
+  lambdaCut: number;
+  cutSigma: number;
   exportMode: ExportMode;
   frameWidthIn: number;
   frameBorderIn: number;
@@ -2155,6 +2328,10 @@ function OutputScreen({
   const [standError, setStandError] = useState<string | null>(null);
   const [isExportingLayers, setIsExportingLayers] = useState(false);
   const [layersError, setLayersError] = useState<string | null>(null);
+  const [isExportingFront, setIsExportingFront] = useState(false);
+  const [frontError, setFrontError] = useState<string | null>(null);
+  const [isExportingMap, setIsExportingMap] = useState(false);
+  const [mapError, setMapError] = useState<string | null>(null);
 
   // Live engrave-density preview for the focused layer (paired with the per-layer sliders below).
   const [focusedLayer, setFocusedLayer] = useState(0);
@@ -2250,7 +2427,7 @@ function OutputScreen({
         await exportLayers(
           sessionId, markings, numLayers, objective, lambdaDepth,
           connectivity, yMonotone, connectivityMethod, norelTime, mipFocus,
-          lambdaCoherence, minLayerArea, cutScore,
+          lambdaCoherence, minLayerArea, cutScore, timeLimit, lambdaCut, cutSigma,
           exportMode, frameWidthIn, frameBorderIn,
           engraveLayers, minEngraveInPerLayer,
         ),
@@ -2260,6 +2437,41 @@ function OutputScreen({
       setLayersError(err?.message ?? "Layer export failed");
     } finally {
       setIsExportingLayers(false);
+    }
+  };
+
+  const handleDownloadFrontView = async () => {
+    if (!sessionId) return;
+    setFrontError(null);
+    setIsExportingFront(true);
+    try {
+      dlBlob(
+        `TunnelBook_${safeBase}_front_view_${stamp}.zip`,
+        await exportFrontView(
+          sessionId, numLayers, minEngraveInPerLayer, engraveLayers,
+          frameWidthIn, exportMode,
+        ),
+      );
+    } catch (err: any) {
+      setFrontError(err?.message ?? "Front view export failed");
+    } finally {
+      setIsExportingFront(false);
+    }
+  };
+
+  const handleDownloadLayerMap = async () => {
+    if (!sessionId) return;
+    setMapError(null);
+    setIsExportingMap(true);
+    try {
+      dlBlob(
+        `TunnelBook_${safeBase}_layer_map_${stamp}.png`,
+        await exportLayerMap(sessionId),
+      );
+    } catch (err: any) {
+      setMapError(err?.message ?? "Layer map export failed");
+    } finally {
+      setIsExportingMap(false);
     }
   };
 
@@ -2300,15 +2512,13 @@ function OutputScreen({
             <div className="output-info">
               <span className="output-filename">{selectedEdgeCount} cut edge{selectedEdgeCount !== 1 ? "s" : ""} selected</span>
               <div className="output-meta">
-                <span className="output-layer-tag">Step 1 complete</span>
-                <span className="output-mode-tag"><I.Scissors /> outline</span>
+                <span className="output-layer-tag">{objective} objective</span>
+                <span className="output-mode-tag">
+                  {exportMode === "engraving" ? <><I.Brush /> engraving</> : <><I.Scissors /> outline</>}
+                </span>
               </div>
             </div>
           </div>
-        </div>
-        <div style={{ padding: "10px 16px 14px", color: "var(--text-dim)", fontSize: 11, lineHeight: 1.6 }}>
-          // edge selections stored · superpixels computed<br />
-          // depth binning + layer assignment → step 2
         </div>
       </div>
 
@@ -2442,6 +2652,24 @@ function OutputScreen({
         >
           <I.DownloadCloud /> {isExportingStand ? "Generating…" : "Export stand (.ai)"}
         </button>
+        <button
+          className="action-btn action-btn--stand"
+          onClick={handleDownloadFrontView}
+          disabled={isExportingFront || !sessionId}
+          title={"Render the stacked plywood front view + each wood sheet at the current "
+            + "per-layer engrave settings (needs a solve — export layers once or load a run)"}
+        >
+          <I.BookOpen /> {isExportingFront ? "Rendering…" : "Export front view (.zip)"}
+        </button>
+        <button
+          className="action-btn action-btn--stand"
+          onClick={handleDownloadLayerMap}
+          disabled={isExportingMap || !sessionId}
+          title={"High-res layer-assignment map: viridis-colored layers (front dark, back "
+            + "yellow) over the grayscale photo with a numbered legend (needs a solve)"}
+        >
+          <I.SquareStack size={14} /> {isExportingMap ? "Rendering…" : "Export layer map (.png)"}
+        </button>
       </div>
 
       {layersError && (
@@ -2452,6 +2680,16 @@ function OutputScreen({
       {standError && (
         <div className="error-banner">
           <span className="error-banner-tag">Error</span> {standError}
+        </div>
+      )}
+      {frontError && (
+        <div className="error-banner">
+          <span className="error-banner-tag">Error</span> {frontError}
+        </div>
+      )}
+      {mapError && (
+        <div className="error-banner">
+          <span className="error-banner-tag">Error</span> {mapError}
         </div>
       )}
     </div>
@@ -2480,7 +2718,7 @@ function App() {
   const [edgeConfigs, setEdgeConfigs] = useState<EdgeConfigItem[]>([]);
   const [selectedEdgeCount, setSelectedEdgeCount] = useState(0);
   const [markings, setMarkings] = useState<{ index: number; type: MarkType }[]>([]);
-  const [objective, setObjective] = useState<"depth" | "cut">("depth");
+  const [objective, setObjective] = useState<"depth" | "cut">("cut");
   const [lambdaDepth, setLambdaDepth] = useState(0.5);
   const [connectivity, setConnectivity] = useState(true);
   const [yMonotone, setYMonotone] = useState(true);
@@ -2490,6 +2728,9 @@ function App() {
   const [lambdaCoherence, setLambdaCoherence] = useState(0);
   const [minLayerArea, setMinLayerArea] = useState(0.04);
   const [cutScore, setCutScore] = useState<CutScore>("meandiff");
+  const [timeLimit, setTimeLimit] = useState(180);
+  const [lambdaCut, setLambdaCut] = useState(1.0);
+  const [cutSigma, setCutSigma] = useState(0.15);
   const [regionMap, setRegionMap] = useState<string | null>(null);
   const [regionDepth, setRegionDepth] = useState<number[]>([]);
   // per-layer engrave overrides (sized to the layer count on solve); [] = use the global mode/floor
@@ -2510,7 +2751,10 @@ function App() {
     setEdgeConfigs([]);
     setSelectedEdgeCount(0);
     setMarkings([]);
-    setObjective("depth");
+    setObjective("cut");
+    setTimeLimit(180);
+    setLambdaCut(1.0);
+    setCutSigma(0.15);
     setBackendError(null);
     setFrameWidthIn(12);
     setFrameHeightIn(9);
@@ -2522,11 +2766,13 @@ function App() {
     setImageFile(null);
   };
 
-  const handleLoadRun = async (runId: string) => {
+  // Resolves to null on success, or the error message (also mirrored into the home banner) so
+  // the load modal can show it inline and stay open.
+  const handleLoadRun = async (src: { runId?: string; path?: string }): Promise<string | null> => {
     setBackendError(null);
     setIsStarting(true);
     try {
-      const d = await loadRun(runId);
+      const d = await loadRun(src);
       const c = d.config;
       setImageFile(null);
       setSessionId(d.sessionId);
@@ -2551,8 +2797,11 @@ function App() {
       setLoadedName(d.runName ?? d.datasetSlug ?? "loaded run");
       setLoadedPreview(d.overlay ?? null);
       setScreen("output");
+      return null;
     } catch (err: any) {
-      setBackendError(err?.message ?? "Failed to load run");
+      const msg = err?.message ?? "Failed to load run";
+      setBackendError(msg);
+      return msg;
     } finally {
       setIsStarting(false);
     }
@@ -2608,6 +2857,9 @@ function App() {
     lambdaCoh: number,
     minArea: number,
     cScore: CutScore,
+    tLimit: number,
+    lCut: number,
+    cSigma: number,
   ) => {
     setMarkings(marks);
     setObjective(obj);
@@ -2618,6 +2870,9 @@ function App() {
     setLambdaCoherence(lambdaCoh);
     setMinLayerArea(minArea);
     setCutScore(cScore);
+    setTimeLimit(tLimit);
+    setLambdaCut(lCut);
+    setCutSigma(cSigma);
     setNorelTime(norel);
     setMipFocus(focus);
     setSelectedEdgeCount(markCount);
@@ -2678,6 +2933,9 @@ function App() {
               lambdaCoherence={lambdaCoherence}
               minLayerArea={minLayerArea}
               cutScore={cutScore}
+              timeLimit={timeLimit}
+              lambdaCut={lambdaCut}
+              cutSigma={cutSigma}
               exportMode={exportMode}
               frameWidthIn={frameWidthIn}
               frameBorderIn={frameBorderIn}
